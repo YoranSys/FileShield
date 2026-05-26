@@ -1,0 +1,39 @@
+#ifndef FILESHIELD_PERSIST_H
+#define FILESHIELD_PERSIST_H
+
+#include <sys/types.h>
+#include <limits.h>
+
+#define PERSIST_MAX_ENTRIES 256
+#define PERSIST_CHAIN_MAX 3
+#define PERSIST_STATE_DIR "/var/lib/fileshield"
+#define PERSIST_STATE_FILE PERSIST_STATE_DIR "/runtime-allowlist.json"
+
+/*
+ * Persistent runtime allowlist entry: mirrors a DynAllowEntry from fanotify.c
+ * but is meant to be serialized to JSON and reloaded on daemon restart.
+ */
+typedef struct
+{
+    char binary[PATH_MAX];
+    char binary_sha512[129];
+    char chain_comm[PERSIST_CHAIN_MAX][256];
+    char chain_sha512[PERSIST_CHAIN_MAX][129];
+    int chain_depth;
+    time_t created_at;
+} PersistEntry;
+
+/*
+ * Public API: load and save persistent entries
+ */
+
+/* Load persisted entries from JSON file. Returns count of entries loaded, or -1 on error. */
+int persist_load(PersistEntry *out_entries, int max_entries);
+
+/* Save entries to JSON file. Returns 0 on success, -1 on error. */
+int persist_save(const PersistEntry *entries, int count);
+
+/* Delete the persistent state file. Used on daemon cleanup. */
+int persist_delete(void);
+
+#endif

@@ -1,0 +1,277 @@
+#include <errno.h>
+#include <pwd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <limits.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <syslog.h>
+
+#include "notify.h"
+#include "utils.h"
+
+/* UID of the desktop user whose Wayland session we detected. 0 = not found. */
+static uid_t g_session_uid = 0;
+
+/*
+ * setup_display_env: scan /run/user/<uid>/ to find an active Wayland session
+ * and export WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS.
+ * Also records the session owner UID so the dialog child can drop privileges.
+ */
+static void setup_display_env(void)
+{
+    if (getenv("WAYLAND_DISPLAY") || getenv("DISPLAY"))
+        return;
+
+    DIR *top = opendir("/run/user");
+    if (!top)
+        return;
+
+    struct dirent *uid_ent;
+    while ((uid_ent = readdir(top)) != NULL)
+    {
+        if (uid_ent->d_name[0] == '.')
+            continue;
+
+        /* Only consider numeric entries that are not root (uid > 0). */
+        char *endptr;
+        unsigned long uid_val = strtoul(uid_ent->d_name, &endptr, 10);
+        if (*endptr != '\0' || uid_val == 0)
+            continue;
+
+        char user_dir[PATH_MAX];
+        snprintf(user_dir, sizeof(user_dir), "/run/user/%s", uid_ent->d_name);
+
+        /* Look for a wayland-N socket (not a .lock file). */
+        DIR *d = opendir(user_dir);
+        if (!d)
+            continue;
+
+        char wayland_sock[256] = "";
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL)
+        {
+            if (strncmp(ent->d_name, "wayland-", 8) == 0 &&
+                strstr(ent->d_name, ".lock") == NULL)
+            {
+                snprintf(wayland_sock, sizeof(wayland_sock), "%s", ent->d_name);
+                break;
+            }
+        }
+        closedir(d);
+
+        if (wayland_sock[0] != '\0')
+        {
+            setenv("WAYLAND_DISPLAY", wayland_sock, 1);
+            setenv("XDG_RUNTIME_DIR", user_dir, 1);
+            char dbus[PATH_MAX + 32];
+            snprintf(dbus, sizeof(dbus), "unix:path=%s/bus", user_dir);
+            setenv("DBUS_SESSION_BUS_ADDRESS", dbus, 1);
+            g_session_uid = (uid_t)uid_val;
+            break;
+        }
+    }
+    closedir(top);
+}
+
+/*
+ * drop_to_session_user: called in the dialog child after fork().
+ * Switches uid/gid to the desktop user so kdialog can connect to their
+ * Wayland compositor and D-Bus session (sockets are mode 0600, owner=user).
+ */
+static void drop_to_session_user(void)
+{
+    if (g_session_uid == 0 || getuid() != 0)
+        return;
+
+    struct passwd *pw = getpwuid(g_session_uid);
+    if (!pw)
+        return;
+
+    setenv("HOME", pw->pw_dir, 1);
+
+    /* Drop gid first (must happen before dropping uid). */
+    if (setgid(pw->pw_gid) < 0 || setuid(g_session_uid) < 0)
+        _exit(127);
+}
+
+static int run_dialog(const char *bin, const char *text)
+{
+    /*
+     * We need a pipe to capture zenity's stdout: when the user clicks the
+     * "Always Allow" extra-button, zenity prints the button label to stdout
+     * and exits 1 — the same exit code as "Deny".  Reading stdout lets us
+     * tell them apart.  kdialog uses distinct exit codes instead, so the
+     * pipe is harmless there.
+     */
+    int pipefd[2];
+    if (pipe(pipefd) < 0)
+    {
+        log_msg(LOG_ERR, "pipe failed for dialog: %m");
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        log_msg(LOG_ERR, "fork failed for %s: %m", bin);
+        return -1;
+    }
+
+    if (pid == 0)
+    {
+        drop_to_session_user();
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0)
+            _exit(127);
+        close(pipefd[1]);
+
+        if (strcmp(bin, "zenity") == 0)
+        {
+            /*
+             * Three buttons:
+             *   Allow Once   → OK button     → exit 0
+             *   Always Allow → extra-button  → exit 1 + stdout="Always Allow"
+             *   Deny         → Cancel button → exit 1 + stdout=""
+             * Timeout (30 s) → exit 5
+             */
+            execl("/usr/bin/zenity", "zenity",
+                  "--question", "--title=FileShield", "--no-markup",
+                  "--timeout=30",
+                  "--text", text,
+                  "--width=600",
+                  "--ok-label=Allow Once",
+                  "--cancel-label=Deny",
+                  "--extra-button=Always Allow",
+                  (char *)NULL);
+        }
+        else
+        {
+            /*
+             * kdialog --yesnocancel with relabelled buttons:
+             *   Allow Once   → Yes    → exit 0
+             *   Always Allow → No     → exit 1
+             *   Deny         → Cancel → exit 2
+             * Timeout via coreutils timeout(1) → exit 124
+             */
+            execl("/usr/bin/timeout", "timeout", "30",
+                  "/usr/bin/kdialog", "kdialog",
+                  "--title", "FileShield",
+                  "--yesnocancel", text,
+                  "--yes-label", "Allow Once",
+                  "--no-label", "Always Allow",
+                  "--cancel-label", "Deny",
+                  (char *)NULL);
+        }
+        _exit(127);
+    }
+
+    /* Parent: close write end, read stdout (for zenity extra-button label). */
+    close(pipefd[1]);
+    char out[64] = "";
+    ssize_t nr = read(pipefd[0], out, sizeof(out) - 1);
+    if (nr > 0)
+        out[nr] = '\0';
+    close(pipefd[0]);
+
+    int status;
+    while (waitpid(pid, &status, 0) < 0)
+    {
+        if (errno == EINTR)
+            continue;
+        log_msg(LOG_ERR, "waitpid failed: %m");
+        return -1;
+    }
+
+    if (!WIFEXITED(status))
+        return -1;
+
+    int ec = WEXITSTATUS(status);
+
+    if (strcmp(bin, "zenity") == 0)
+    {
+        if (ec == 5)
+            return NOTIFY_DENY; /* timeout                  */
+        if (ec == 0)
+            return NOTIFY_ALLOW_ONCE; /* OK / Allow Once          */
+        /* ec == 1: extra-button OR Cancel — distinguish by stdout */
+        if (strncmp(out, "Always Allow", 12) == 0)
+            return NOTIFY_ALLOW_ALWAYS;
+        return NOTIFY_DENY; /* Cancel / Deny            */
+    }
+    else
+    {
+        /* kdialog wrapped by timeout(1) */
+        if (ec == 124)
+            return NOTIFY_DENY; /* coreutils timeout        */
+        if (ec == 0)
+            return NOTIFY_ALLOW_ONCE; /* Yes  / Allow Once        */
+        if (ec == 1)
+            return NOTIFY_ALLOW_ALWAYS; /* No   / Always Allow      */
+        return NOTIFY_DENY;             /* Cancel / Deny or error   */
+    }
+}
+
+int notify_ask(const char *comm, pid_t pid, pid_t ppid,
+               const char *comm_parent, const char *exe,
+               const char *cmdline, const char *path)
+{
+    /* Return values: NOTIFY_ALLOW_ONCE, NOTIFY_DENY, or NOTIFY_ALLOW_ALWAYS. */
+    char msg[2048];
+
+    /* Truncate the command line if it is too long for the dialog. */
+    char cmd_display[256] = "(unknown)";
+    if (cmdline && cmdline[0] != '\0')
+    {
+        snprintf(cmd_display, sizeof(cmd_display), "%s", cmdline);
+        if (strlen(cmdline) > sizeof(cmd_display) - 4)
+        {
+            cmd_display[sizeof(cmd_display) - 4] = '.';
+            cmd_display[sizeof(cmd_display) - 3] = '.';
+            cmd_display[sizeof(cmd_display) - 2] = '.';
+            cmd_display[sizeof(cmd_display) - 1] = '\0';
+        }
+    }
+
+    snprintf(msg, sizeof(msg),
+             "Process %s (PID %d, parent: %s (PID %d)) wants to read:\n"
+             "%s\n\n"
+             "Binary:   %s\n"
+             "Command:  %s\n\n"
+             "\xe2\x80\xa2 Allow Once    \xe2\x80\x94 grant access this time only\n"
+             "\xe2\x80\xa2 Always Allow  \xe2\x80\x94 trust this exact binary (SHA-512 verified)\n"
+             "                in this call chain permanently\n"
+             "\xe2\x80\xa2 Deny          \xe2\x80\x94 block access",
+             comm, (int)pid, comm_parent, (int)ppid,
+             path,
+             exe ? exe : "(unknown)",
+             cmd_display);
+
+    /* Auto-detect the active graphical session if env vars are not set. */
+    setup_display_env();
+
+    /* On Wayland (KDE), prefer kdialog; on X11, prefer zenity. */
+    if (getenv("WAYLAND_DISPLAY"))
+    {
+        int r = run_dialog("kdialog", msg);
+        if (r == NOTIFY_ALLOW_ONCE || r == NOTIFY_DENY || r == NOTIFY_ALLOW_ALWAYS)
+            return r;
+        log_msg(LOG_WARNING, "kdialog failed, falling back to zenity");
+    }
+
+    if (getenv("DISPLAY"))
+    {
+        int r = run_dialog("zenity", msg);
+        if (r == NOTIFY_ALLOW_ONCE || r == NOTIFY_DENY || r == NOTIFY_ALLOW_ALWAYS)
+            return r;
+        log_msg(LOG_WARNING, "zenity failed");
+    }
+
+    log_msg(LOG_ERR, "no graphical dialog available; denying access to %s", path);
+    return 1; /* fail-close */
+}

@@ -1,0 +1,46 @@
+[Unit]
+Description=FileShield - file access interceptor
+Documentation=https://github.com/yoransys/fileshield
+After=multi-user.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/sbin/fileshield --foreground
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Display settings are auto-detected from /run/user/ at runtime (Wayland and X11).
+# Override here only if auto-detection fails in your setup:
+# Environment=WAYLAND_DISPLAY=wayland-1
+# Environment=DISPLAY=:0
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+StateDirectory=fileshield
+# ProtectHome cannot be enabled: the daemon places fanotify marks on the real
+# /home mount. ProtectHome would create a separate bind-mount namespace, making
+# fanotify_mark() target a shadow mount that user processes never open, so all
+# home-directory marks would be silently ineffective.
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+SystemCallFilter=@system-service rseq fanotify_init fanotify_mark setuid setgid setresuid setresgid
+SystemCallArchitectures=native
+
+# fanotify requires CAP_SYS_ADMIN; /proc/<pid>/exe requires CAP_SYS_PTRACE;
+# CAP_DAC_READ_SEARCH is required to traverse home directories with mode 750
+# (e.g. /home/user drwxr-x--- ) so that fanotify_mark can resolve their paths.
+# CAP_SETUID + CAP_SETGID are required to drop to the desktop user before
+# spawning kdialog/zenity (session sockets are mode 0600, owner=user).
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID
+
+[Install]
+WantedBy=multi-user.target

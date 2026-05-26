@@ -1,0 +1,39 @@
+# Build output
+build/
+
+# C/C++ artifacts
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.d
+
+# Debug, coverage, and profiling artifacts
+*.gcno
+*.gcda
+*.gcov
+*.prof
+*.profraw
+*.profdata
+
+# Runtime dumps/logs
+core
+core.*
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
