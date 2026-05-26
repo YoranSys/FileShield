@@ -154,10 +154,26 @@ int main(int argc, char *argv[])
 
     /* Load persisted "Always Allow" entries from the previous session. */
     {
-        PersistEntry persist_buf[PERSIST_MAX_ENTRIES];
-        int persist_count = persist_load(persist_buf, PERSIST_MAX_ENTRIES);
-        if (persist_count > 0)
-            fanotify_load_dyn_allowlist(persist_buf, persist_count);
+        PersistEntry *persist_buf = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+        if (persist_buf)
+        {
+            int persist_count = persist_load(PERSIST_STATE_FILE, persist_buf, PERSIST_MAX_ENTRIES);
+            if (persist_count > 0)
+                fanotify_load_dyn_allowlist(persist_buf, persist_count);
+            free(persist_buf);
+        }
+    }
+
+    /* Load persisted "Always Deny" entries from the previous session. */
+    {
+        PersistEntry *deny_buf = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+        if (deny_buf)
+        {
+            int deny_count = persist_load(PERSIST_DENY_STATE_FILE, deny_buf, PERSIST_MAX_ENTRIES);
+            if (deny_count > 0)
+                fanotify_load_dyn_denylist(deny_buf, deny_count);
+            free(deny_buf);
+        }
     }
 
     while (g_running)

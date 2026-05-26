@@ -98,14 +98,102 @@ static void drop_to_session_user(void)
         _exit(127);
 }
 
+static int run_dialog_confirm(const char *bin, const char *text,
+                              const char *yes_label, const char *no_label,
+                              int ret_yes, int ret_no)
+{
+    int pipefd[2];
+    if (pipe(pipefd) < 0)
+    {
+        log_msg(LOG_ERR, "pipe failed for confirm dialog: %m");
+        return ret_yes;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return ret_yes;
+    }
+
+    if (pid == 0)
+    {
+        drop_to_session_user();
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0)
+            _exit(127);
+        close(pipefd[1]);
+
+        if (strcmp(bin, "zenity") == 0)
+        {
+            execl("/usr/bin/zenity", "zenity",
+                  "--question", "--title=FileShield", "--no-markup",
+                  "--timeout=30",
+                  "--ok-label", yes_label,
+                  "--cancel-label", no_label,
+                  "--text", text,
+                  "--width=450",
+                  (char *)NULL);
+        }
+        else
+        {
+            execl("/usr/bin/timeout", "timeout", "30",
+                  "/usr/bin/kdialog", "kdialog",
+                  "--title", "FileShield",
+                  "--yesno", text,
+                  "--yes-label", yes_label,
+                  "--no-label", no_label,
+                  (char *)NULL);
+        }
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    {
+        char out[64];
+        ssize_t nr = read(pipefd[0], out, sizeof(out) - 1);
+        (void)nr;
+    }
+    close(pipefd[0]);
+
+    int status;
+    while (waitpid(pid, &status, 0) < 0)
+    {
+        if (errno == EINTR)
+            continue;
+        return ret_yes;
+    }
+
+    if (!WIFEXITED(status))
+        return ret_yes;
+
+    int ec = WEXITSTATUS(status);
+
+    if (strcmp(bin, "zenity") == 0)
+    {
+        if (ec == 0)
+            return ret_yes;
+        return ret_no;
+    }
+    else
+    {
+        if (ec == 124) /* timeout → safe default */
+            return ret_yes;
+        if (ec == 0)   /* Yes / Deny Once */
+            return ret_yes;
+        /* No / Always Deny (ec == 1) or error → explicit user choice */
+        return ret_no;
+    }
+}
+
 static int run_dialog(const char *bin, const char *text)
 {
     /*
-     * We need a pipe to capture zenity's stdout: when the user clicks the
-     * "Always Allow" extra-button, zenity prints the button label to stdout
-     * and exits 1 — the same exit code as "Deny".  Reading stdout lets us
-     * tell them apart.  kdialog uses distinct exit codes instead, so the
-     * pipe is harmless there.
+     * Three-button dialog (zenity --question --extra-button,
+     * kdialog --yesnocancel).  The fourth action ("Always Deny")
+     * is handled as a follow-up confirmation when the user clicks
+     * "Deny" — this adds a safety step for permanent blocks.
      */
     int pipefd[2];
     if (pipe(pipefd) < 0)
@@ -202,18 +290,17 @@ static int run_dialog(const char *bin, const char *text)
         /* ec == 1: extra-button OR Cancel — distinguish by stdout */
         if (strncmp(out, "Always Allow", 12) == 0)
             return NOTIFY_ALLOW_ALWAYS;
-        return NOTIFY_DENY; /* Cancel / Deny            */
+        return NOTIFY_DENY; /* Cancel / Deny → may trigger follow-up */
     }
     else
     {
-        /* kdialog wrapped by timeout(1) */
         if (ec == 124)
             return NOTIFY_DENY; /* coreutils timeout        */
         if (ec == 0)
             return NOTIFY_ALLOW_ONCE; /* Yes  / Allow Once        */
         if (ec == 1)
             return NOTIFY_ALLOW_ALWAYS; /* No   / Always Allow      */
-        return NOTIFY_DENY;             /* Cancel / Deny or error   */
+        return NOTIFY_DENY;             /* Cancel / Deny → may trigger follow-up */
     }
 }
 
@@ -221,7 +308,8 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
                const char *comm_parent, const char *exe,
                const char *cmdline, const char *path)
 {
-    /* Return values: NOTIFY_ALLOW_ONCE, NOTIFY_DENY, or NOTIFY_ALLOW_ALWAYS. */
+    /* Return values: NOTIFY_ALLOW_ONCE, NOTIFY_DENY,
+     *                NOTIFY_ALLOW_ALWAYS, or NOTIFY_DENY_ALWAYS. */
     char msg[2048];
 
     /* Truncate the command line if it is too long for the dialog. */
@@ -246,7 +334,7 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
              "\xe2\x80\xa2 Allow Once    \xe2\x80\x94 grant access this time only\n"
              "\xe2\x80\xa2 Always Allow  \xe2\x80\x94 trust this exact binary (SHA-512 verified)\n"
              "                in this call chain permanently\n"
-             "\xe2\x80\xa2 Deny          \xe2\x80\x94 block access",
+             "\xe2\x80\xa2 Deny          \xe2\x80\x94 block access (will prompt for once/always)",
              comm, (int)pid, comm_parent, (int)ppid,
              path,
              exe ? exe : "(unknown)",
@@ -255,23 +343,44 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
     /* Auto-detect the active graphical session if env vars are not set. */
     setup_display_env();
 
-    /* On Wayland (KDE), prefer kdialog; on X11, prefer zenity. */
+    /* Determine which dialog binary to use. */
+    const char *bin = NULL;
+
     if (getenv("WAYLAND_DISPLAY"))
     {
         int r = run_dialog("kdialog", msg);
-        if (r == NOTIFY_ALLOW_ONCE || r == NOTIFY_DENY || r == NOTIFY_ALLOW_ALWAYS)
+        if (r == NOTIFY_ALLOW_ONCE || r == NOTIFY_ALLOW_ALWAYS)
             return r;
-        log_msg(LOG_WARNING, "kdialog failed, falling back to zenity");
+        if (r == NOTIFY_DENY)
+            bin = "kdialog";
+        else
+            log_msg(LOG_WARNING, "kdialog failed, falling back to zenity");
     }
 
-    if (getenv("DISPLAY"))
+    if (!bin && getenv("DISPLAY"))
     {
         int r = run_dialog("zenity", msg);
-        if (r == NOTIFY_ALLOW_ONCE || r == NOTIFY_DENY || r == NOTIFY_ALLOW_ALWAYS)
+        if (r == NOTIFY_ALLOW_ONCE || r == NOTIFY_ALLOW_ALWAYS)
             return r;
-        log_msg(LOG_WARNING, "zenity failed");
+        if (r == NOTIFY_DENY)
+            bin = "zenity";
+        else
+            log_msg(LOG_WARNING, "zenity failed");
     }
 
-    log_msg(LOG_ERR, "no graphical dialog available; denying access to %s", path);
-    return 1; /* fail-close */
+    if (!bin)
+    {
+        log_msg(LOG_ERR, "no graphical dialog available; denying access to %s", path);
+        return NOTIFY_DENY;
+    }
+
+    /* User clicked Deny in the first dialog.  Show a follow-up to
+     * distinguish between "Deny Once" and "Always Deny". */
+    return run_dialog_confirm(bin,
+                "Block access this time only, or permanently?\n\n"
+                "\xe2\x80\xa2 Deny Once     \xe2\x80\x94 block this time only\n"
+                "\xe2\x80\xa2 Always Deny  \xe2\x80\x94 block this exact binary (SHA-512 verified)\n"
+                "                 in this call chain permanently",
+                "Deny Once", "Always Deny",
+                NOTIFY_DENY, NOTIFY_DENY_ALWAYS);
 }

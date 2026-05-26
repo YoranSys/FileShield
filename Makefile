@@ -69,7 +69,8 @@ install: all
 	install -m 0755 -D $(OBJDIR)/$(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
 	install -m 0640 -D fileshield.conf $(DESTDIR)$(ETCDIR)/fileshield.conf
 	install -m 0644 -D fileshield.service $(DESTDIR)$(SYSDDIR)/fileshield.service
-
+	systemctl daemon-reload
+	sudo systemctl restart fileshield
 clean:
 	rm -rf $(OBJDIR)
 

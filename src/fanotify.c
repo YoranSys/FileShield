@@ -143,22 +143,20 @@ static int allowlist_match(const char *binary, int *ttl_out)
 /*  process call-chain (parent → grandparent → great-grandparent)     */
 /* ------------------------------------------------------------------ */
 
-#define CHAIN_MAX 3
-
 typedef struct
 {
-    pid_t pid[CHAIN_MAX];
-    char comm[CHAIN_MAX][256];
-    char exe[CHAIN_MAX][PATH_MAX];
-    char sha512[CHAIN_MAX][129]; /* lowercase hex SHA-512 of each ancestor exe */
-    int depth;                   /* how many ancestors were captured            */
+    pid_t pid[PERSIST_CHAIN_MAX];
+    char comm[PERSIST_CHAIN_MAX][256];
+    char exe[PERSIST_CHAIN_MAX][PATH_MAX];
+    char sha512[PERSIST_CHAIN_MAX][129]; /* lowercase hex SHA-512 of each ancestor exe */
+    int depth;                           /* how many ancestors were captured            */
 } ProcChain;
 
 static void build_proc_chain(pid_t start_pid, ProcChain *c)
 {
     memset(c, 0, sizeof(*c));
     pid_t cur = start_pid;
-    for (int i = 0; i < CHAIN_MAX; i++)
+    for (int i = 0; i < PERSIST_CHAIN_MAX; i++)
     {
         pid_t p = get_ppid(cur);
         if (p <= 1)
@@ -189,13 +187,31 @@ typedef struct
 {
     char binary[PATH_MAX];
     char binary_sha512[129];
-    char chain_comm[CHAIN_MAX][256];
-    char chain_sha512[CHAIN_MAX][129];
+    char chain_comm[PERSIST_CHAIN_MAX][256];
+    char chain_sha512[PERSIST_CHAIN_MAX][129];
     int chain_depth;
 } DynAllowEntry;
 
 static DynAllowEntry g_dyn_allow[DYN_ALLOW_MAX];
 static int g_dyn_allow_count = 0;
+
+/* ------------------------------------------------------------------ */
+/*  runtime dynamic denylist ("Always Deny" decisions)                */
+/* ------------------------------------------------------------------ */
+
+#define DYN_DENY_MAX 256
+
+typedef struct
+{
+    char binary[PATH_MAX];
+    char binary_sha512[129];
+    char chain_comm[PERSIST_CHAIN_MAX][256];
+    char chain_sha512[PERSIST_CHAIN_MAX][129];
+    int chain_depth;
+} DynDenyEntry;
+
+static DynDenyEntry g_dyn_deny[DYN_DENY_MAX];
+static int g_dyn_deny_count = 0;
 
 /*
  * dyn_allow_match: returns 1 if (binary, bin_sha512, chain) matches a stored
@@ -294,28 +310,162 @@ static void dyn_allow_add(const char *binary, const char *bin_sha512,
             binary, sha_short, chain->depth);
 
     /* Persist the updated dynamic allowlist to disk. */
-    PersistEntry persist_buf[DYN_ALLOW_MAX];
-    memset(persist_buf, 0, sizeof(persist_buf));
-    for (int i = 0; i < g_dyn_allow_count; i++)
+    PersistEntry *persist_buf = calloc(DYN_ALLOW_MAX, sizeof(PersistEntry));
+    if (persist_buf)
     {
-        DynAllowEntry *src = &g_dyn_allow[i];
-        PersistEntry *dst = &persist_buf[i];
-        memcpy(dst->binary, src->binary, sizeof(src->binary));
-        dst->binary[sizeof(dst->binary) - 1] = '\0';
-        memcpy(dst->binary_sha512, src->binary_sha512, sizeof(src->binary_sha512));
-        dst->binary_sha512[sizeof(dst->binary_sha512) - 1] = '\0';
-        dst->chain_depth = src->chain_depth;
-        for (int j = 0; j < src->chain_depth; j++)
+        for (int i = 0; i < g_dyn_allow_count; i++)
         {
-            memcpy(dst->chain_comm[j], src->chain_comm[j], sizeof(src->chain_comm[j]));
-            dst->chain_comm[j][sizeof(dst->chain_comm[j]) - 1] = '\0';
-            memcpy(dst->chain_sha512[j], src->chain_sha512[j], sizeof(src->chain_sha512[j]));
-            dst->chain_sha512[j][sizeof(dst->chain_sha512[j]) - 1] = '\0';
+            DynAllowEntry *src = &g_dyn_allow[i];
+            PersistEntry *dst = &persist_buf[i];
+            memcpy(dst->binary, src->binary, sizeof(src->binary));
+            dst->binary[sizeof(dst->binary) - 1] = '\0';
+            memcpy(dst->binary_sha512, src->binary_sha512, sizeof(src->binary_sha512));
+            dst->binary_sha512[sizeof(dst->binary_sha512) - 1] = '\0';
+            dst->chain_depth = src->chain_depth;
+            for (int j = 0; j < src->chain_depth; j++)
+            {
+                memcpy(dst->chain_comm[j], src->chain_comm[j], sizeof(src->chain_comm[j]));
+                dst->chain_comm[j][sizeof(dst->chain_comm[j]) - 1] = '\0';
+                memcpy(dst->chain_sha512[j], src->chain_sha512[j], sizeof(src->chain_sha512[j]));
+                dst->chain_sha512[j][sizeof(dst->chain_sha512[j]) - 1] = '\0';
+            }
+            dst->created_at = time(NULL);
         }
-        dst->created_at = time(NULL);
+        if (persist_save(PERSIST_STATE_FILE, persist_buf, g_dyn_allow_count) < 0)
+            log_msg(LOG_WARNING, "persist_save failed; entry not persisted");
+        free(persist_buf);
     }
-    if (persist_save(persist_buf, g_dyn_allow_count) < 0)
-        log_msg(LOG_WARNING, "persist_save failed; entry not persisted");
+    else
+    {
+        log_msg(LOG_ERR, "out of memory persisting allowlist");
+    }
+}
+
+/*
+ * dyn_deny_match: returns 1 if (binary, bin_sha512, chain) matches a stored
+ * "Always Deny" entry, 0 otherwise.
+ *
+ * Matching rules (fail-open for denial safety):
+ *   - Binary path must match.
+ *   - If both sides have a SHA-512, they must be equal.
+ *   - If the stored entry has a SHA-512 but the current binary's hash
+ *     cannot be computed (e.g., sha512sum missing), we skip the entry
+ *     (do NOT deny) — we cannot verify the binary is the one that was
+ *     supposed to be blocked.  The user will be re-prompted instead.
+ *   - Call-chain depth must match exactly.
+ *   - For each ancestor: comm must match AND, if both sides have a SHA-512,
+ *     they must be equal; if stored has one but current is missing, skip
+ *     (preserve allow — we cannot verify the ancestor).
+ */
+static int dyn_deny_match(const char *binary, const char *bin_sha512,
+                          const ProcChain *chain)
+{
+    for (int i = 0; i < g_dyn_deny_count; i++)
+    {
+        DynDenyEntry *e = &g_dyn_deny[i];
+
+        if (strcmp(e->binary, binary) != 0)
+            continue;
+
+        if (e->binary_sha512[0] != '\0')
+        {
+            if (bin_sha512[0] == '\0')
+                continue;
+            if (strcmp(e->binary_sha512, bin_sha512) != 0)
+                continue;
+        }
+
+        if (e->chain_depth != chain->depth)
+            continue;
+
+        int ok = 1;
+        for (int j = 0; j < chain->depth; j++)
+        {
+            if (strcmp(e->chain_comm[j], chain->comm[j]) != 0)
+            {
+                ok = 0;
+                break;
+            }
+            if (e->chain_sha512[j][0] != '\0')
+            {
+                if (chain->sha512[j][0] == '\0')
+                {
+                    ok = 0;
+                    break;
+                }
+                if (strcmp(e->chain_sha512[j], chain->sha512[j]) != 0)
+                {
+                    ok = 0;
+                    break;
+                }
+            }
+        }
+        if (ok)
+            return 1;
+    }
+    return 0;
+}
+
+static void dyn_deny_add(const char *binary, const char *bin_sha512,
+                         const ProcChain *chain)
+{
+    if (g_dyn_deny_count >= DYN_DENY_MAX)
+    {
+        log_msg(LOG_WARNING, "dynamic denylist full (%d); dropping oldest entry",
+                DYN_DENY_MAX);
+        memmove(&g_dyn_deny[0], &g_dyn_deny[1],
+                sizeof(DynDenyEntry) * (DYN_DENY_MAX - 1));
+        g_dyn_deny_count = DYN_DENY_MAX - 1;
+    }
+
+    DynDenyEntry *e = &g_dyn_deny[g_dyn_deny_count++];
+    memset(e, 0, sizeof(*e));
+    snprintf(e->binary, sizeof(e->binary), "%s", binary);
+    snprintf(e->binary_sha512, sizeof(e->binary_sha512), "%s", bin_sha512);
+    e->chain_depth = chain->depth;
+    for (int i = 0; i < chain->depth; i++)
+    {
+        snprintf(e->chain_comm[i], sizeof(e->chain_comm[i]), "%s", chain->comm[i]);
+        snprintf(e->chain_sha512[i], sizeof(e->chain_sha512[i]), "%s", chain->sha512[i]);
+    }
+
+    char sha_short[17] = "????????????????";
+    if (bin_sha512[0] != '\0')
+        memcpy(sha_short, bin_sha512, 16);
+    sha_short[16] = '\0';
+    log_msg(LOG_INFO,
+            "always-deny added: %s (sha512: %s...) chain-depth=%d",
+            binary, sha_short, chain->depth);
+
+    PersistEntry *persist_buf = calloc(DYN_DENY_MAX, sizeof(PersistEntry));
+    if (persist_buf)
+    {
+        for (int i = 0; i < g_dyn_deny_count; i++)
+        {
+            DynDenyEntry *src = &g_dyn_deny[i];
+            PersistEntry *dst = &persist_buf[i];
+            memcpy(dst->binary, src->binary, sizeof(src->binary));
+            dst->binary[sizeof(dst->binary) - 1] = '\0';
+            memcpy(dst->binary_sha512, src->binary_sha512, sizeof(src->binary_sha512));
+            dst->binary_sha512[sizeof(dst->binary_sha512) - 1] = '\0';
+            dst->chain_depth = src->chain_depth;
+            for (int j = 0; j < src->chain_depth; j++)
+            {
+                memcpy(dst->chain_comm[j], src->chain_comm[j], sizeof(src->chain_comm[j]));
+                dst->chain_comm[j][sizeof(dst->chain_comm[j]) - 1] = '\0';
+                memcpy(dst->chain_sha512[j], src->chain_sha512[j], sizeof(src->chain_sha512[j]));
+                dst->chain_sha512[j][sizeof(dst->chain_sha512[j]) - 1] = '\0';
+            }
+            dst->created_at = time(NULL);
+        }
+        if (persist_save(PERSIST_DENY_STATE_FILE, persist_buf, g_dyn_deny_count) < 0)
+            log_msg(LOG_WARNING, "persist_save failed; denylist entry not persisted");
+        free(persist_buf);
+    }
+    else
+    {
+        log_msg(LOG_ERR, "out of memory persisting denylist");
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -494,8 +644,13 @@ void fanotify_loop(int fd)
                     /* Hash via /proc/<pid>/exe — works for containerised
                      * processes (Podman/Docker) whose binary path does not
                      * exist on the host filesystem. */
-                    sha512_proc_exe(pid, bin_sha512);
+                    int sha_ok = sha512_proc_exe(pid, bin_sha512);
                     build_proc_chain(pid, &chain);
+
+                    if (sha_ok < 0)
+                        log_msg(LOG_WARNING, "SHA-512 computation failed for %s (pid %d); "
+                                "permanent decisions will rely on path + chain only",
+                                binary, (int)pid);
 
                     /* dynamic allowlist check (runtime "Always Allow") */
                     if (dyn_allow_match(binary, bin_sha512, &chain))
@@ -506,6 +661,17 @@ void fanotify_loop(int fd)
                                 "dynamic allowlist hit: %s (pid %d) -> %s",
                                 binary, (int)pid, target);
                         fanotify_respond(fd, ev, FAN_ALLOW);
+                        close(fd_num);
+                        goto cleanup;
+                    }
+
+                    /* dynamic denylist check (runtime "Always Deny") */
+                    if (dyn_deny_match(binary, bin_sha512, &chain))
+                    {
+                        log_msg(LOG_INFO,
+                                "dynamic denylist hit: %s (pid %d) -> %s",
+                                binary, (int)pid, target);
+                        fanotify_respond(fd, ev, FAN_DENY);
                         close(fd_num);
                         goto cleanup;
                     }
@@ -521,6 +687,11 @@ void fanotify_loop(int fd)
                         if (decision == NOTIFY_ALLOW_ALWAYS)
                             dyn_allow_add(binary, bin_sha512, &chain);
                         fanotify_respond(fd, ev, FAN_ALLOW);
+                    }
+                    else if (decision == NOTIFY_DENY_ALWAYS)
+                    {
+                        dyn_deny_add(binary, bin_sha512, &chain);
+                        fanotify_respond(fd, ev, FAN_DENY);
                     }
                     else
                     {
@@ -588,7 +759,6 @@ int fanotify_get_dyn_allowlist(PersistEntry *out_entries, int max_entries)
             memcpy(dst->chain_sha512[j], src->chain_sha512[j], sizeof(src->chain_sha512[j]));
             dst->chain_sha512[j][sizeof(dst->chain_sha512[j]) - 1] = '\0';
         }
-        dst->created_at = time(NULL);
     }
 
     return count;
@@ -609,8 +779,10 @@ void fanotify_load_dyn_allowlist(const PersistEntry *entries, int count)
 
         snprintf(dst->binary, sizeof(dst->binary), "%s", src->binary);
         snprintf(dst->binary_sha512, sizeof(dst->binary_sha512), "%s", src->binary_sha512);
-        dst->chain_depth = src->chain_depth;
-        for (int j = 0; j < src->chain_depth; j++)
+        int depth = src->chain_depth;
+        if (depth > PERSIST_CHAIN_MAX) depth = PERSIST_CHAIN_MAX;
+        dst->chain_depth = depth;
+        for (int j = 0; j < depth; j++)
         {
             snprintf(dst->chain_comm[j], sizeof(dst->chain_comm[j]), "%s", src->chain_comm[j]);
             snprintf(dst->chain_sha512[j], sizeof(dst->chain_sha512[j]), "%s", src->chain_sha512[j]);
@@ -619,4 +791,68 @@ void fanotify_load_dyn_allowlist(const PersistEntry *entries, int count)
 
     g_dyn_allow_count = count;
     log_msg(LOG_INFO, "loaded %d persisted always-allow entries", count);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Public API: dynamic denylist persistence                          */
+/* ------------------------------------------------------------------ */
+
+int fanotify_get_dyn_denylist(PersistEntry *out_entries, int max_entries)
+{
+    if (!out_entries || max_entries <= 0)
+        return 0;
+
+    memset(out_entries, 0, sizeof(*out_entries) * max_entries);
+
+    int count = (g_dyn_deny_count < max_entries) ? g_dyn_deny_count : max_entries;
+
+    for (int i = 0; i < count; i++)
+    {
+        DynDenyEntry *src = &g_dyn_deny[i];
+        PersistEntry *dst = &out_entries[i];
+
+        memcpy(dst->binary, src->binary, sizeof(src->binary));
+        dst->binary[sizeof(dst->binary) - 1] = '\0';
+        memcpy(dst->binary_sha512, src->binary_sha512, sizeof(src->binary_sha512));
+        dst->binary_sha512[sizeof(dst->binary_sha512) - 1] = '\0';
+        dst->chain_depth = src->chain_depth;
+        for (int j = 0; j < src->chain_depth; j++)
+        {
+            memcpy(dst->chain_comm[j], src->chain_comm[j], sizeof(src->chain_comm[j]));
+            dst->chain_comm[j][sizeof(dst->chain_comm[j]) - 1] = '\0';
+            memcpy(dst->chain_sha512[j], src->chain_sha512[j], sizeof(src->chain_sha512[j]));
+            dst->chain_sha512[j][sizeof(dst->chain_sha512[j]) - 1] = '\0';
+        }
+    }
+
+    return count;
+}
+
+void fanotify_load_dyn_denylist(const PersistEntry *entries, int count)
+{
+    if (!entries || count <= 0 || count > DYN_DENY_MAX)
+        return;
+
+    memset(g_dyn_deny, 0, sizeof(g_dyn_deny));
+    g_dyn_deny_count = 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        const PersistEntry *src = &entries[i];
+        DynDenyEntry *dst = &g_dyn_deny[i];
+
+        snprintf(dst->binary, sizeof(dst->binary), "%s", src->binary);
+        snprintf(dst->binary_sha512, sizeof(dst->binary_sha512), "%s", src->binary_sha512);
+        int depth = src->chain_depth;
+        if (depth > PERSIST_CHAIN_MAX) depth = PERSIST_CHAIN_MAX;
+        dst->chain_depth = depth;
+        for (int j = 0; j < depth; j++)
+        {
+            snprintf(dst->chain_comm[j], sizeof(dst->chain_comm[j]), "%s", src->chain_comm[j]);
+            snprintf(dst->chain_sha512[j], sizeof(dst->chain_sha512[j]), "%s", src->chain_sha512[j]);
+        }
+    }
+
+    g_dyn_deny_count = count;
+    log_msg(LOG_INFO, "loaded %d persisted always-deny entries", count);
 }

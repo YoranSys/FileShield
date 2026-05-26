@@ -8,6 +8,7 @@
 #define PERSIST_CHAIN_MAX 3
 #define PERSIST_STATE_DIR "/var/lib/fileshield"
 #define PERSIST_STATE_FILE PERSIST_STATE_DIR "/runtime-allowlist.json"
+#define PERSIST_DENY_STATE_FILE PERSIST_STATE_DIR "/runtime-denylist.json"
 
 /*
  * Persistent runtime allowlist entry: mirrors a DynAllowEntry from fanotify.c
@@ -28,12 +29,12 @@ typedef struct
  */
 
 /* Load persisted entries from JSON file. Returns count of entries loaded, or -1 on error. */
-int persist_load(PersistEntry *out_entries, int max_entries);
+int persist_load(const char *filepath, PersistEntry *out_entries, int max_entries);
 
 /* Save entries to JSON file. Returns 0 on success, -1 on error. */
-int persist_save(const PersistEntry *entries, int count);
+int persist_save(const char *filepath, const PersistEntry *entries, int count);
 
-/* Delete the persistent state file. Used on daemon cleanup. */
-int persist_delete(void);
+/* Delete a persistent state file. Used on daemon cleanup. */
+int persist_delete(const char *filepath);
 
 #endif

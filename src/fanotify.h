@@ -11,7 +11,8 @@ void fanotify_loop(int fd);
 int  fanotify_respond(int fd, const struct fanotify_event_metadata *ev, unsigned int response);
 
 /*
- * Dynamic allowlist management: export the in-memory allowlist for persistence.
+ * Dynamic allowlist / denylist management: export the in-memory lists for
+ * persistence.
  */
 
 /* Get the current dynamic allowlist entries. Returns count of entries. */
@@ -19,5 +20,11 @@ int fanotify_get_dyn_allowlist(PersistEntry *out_entries, int max_entries);
 
 /* Load persisted entries into the dynamic allowlist. Called on daemon startup. */
 void fanotify_load_dyn_allowlist(const PersistEntry *entries, int count);
+
+/* Get the current dynamic denylist entries. Returns count of entries. */
+int fanotify_get_dyn_denylist(PersistEntry *out_entries, int max_entries);
+
+/* Load persisted entries into the dynamic denylist. Called on daemon startup. */
+void fanotify_load_dyn_denylist(const PersistEntry *entries, int count);
 
 #endif

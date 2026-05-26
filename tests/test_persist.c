@@ -67,20 +67,12 @@ static int test_persist_save_mock(const PersistEntry *entries, int count, const 
         fprintf(fp, "      \"binary_sha512\": \"%s\",\n", e->binary_sha512);
         fprintf(fp, "      \"chain_depth\": %d,\n", e->chain_depth);
         fprintf(fp, "      \"created_at\": %ld,\n", (long)e->created_at);
-        fprintf(fp, "      \"chain_comm\": [\n");
         for (j = 0; j < PERSIST_CHAIN_MAX; j++)
-        {
-            fprintf(fp, "        \"%s\"%s\n", e->chain_comm[j],
-                    j < PERSIST_CHAIN_MAX - 1 ? "," : "");
-        }
-        fprintf(fp, "      ],\n");
-        fprintf(fp, "      \"chain_sha512\": [\n");
+            fprintf(fp, "      \"chain_comm[%d]\": \"%s\"%s\n",
+                    j, e->chain_comm[j], j < PERSIST_CHAIN_MAX - 1 ? "," : "");
         for (j = 0; j < PERSIST_CHAIN_MAX; j++)
-        {
-            fprintf(fp, "        \"%s\"%s\n", e->chain_sha512[j],
-                    j < PERSIST_CHAIN_MAX - 1 ? "," : "");
-        }
-        fprintf(fp, "      ]\n");
+            fprintf(fp, "      \"chain_sha512[%d]\": \"%s\"%s\n",
+                    j, e->chain_sha512[j], j < PERSIST_CHAIN_MAX - 1 ? "," : "");
         fprintf(fp, "    }%s\n", i < count - 1 ? "," : "");
     }
 
@@ -114,11 +106,7 @@ static int test_persist_load_mock(PersistEntry *out_entries, int max_entries, co
     char line[4096];
     PersistEntry *current = NULL;
     int count = 0;
-    int in_entry = 0;
-    int in_chain_comm = 0;
-    int in_chain_sha = 0;
-    int chain_idx = 0;
-    int brace_count = 0;
+    enum { S_OUTSIDE, S_IN_ENTRIES, S_IN_ENTRY } state = S_OUTSIDE;
 
     if (!out_entries || max_entries <= 0)
         return 0;
@@ -138,117 +126,95 @@ static int test_persist_load_mock(PersistEntry *out_entries, int max_entries, co
         char *p = line;
         char val_buf[1024];
 
-        /* Skip whitespace */
-        while (*p && (*p == ' ' || *p == '\t'))
+        while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
             p++;
 
-        if (!*p || *p == '\n' || *p == '#')
+        if (!*p || *p == '#')
             continue;
 
-        /* Detect opening brace - only create entry if we're inside entries array */
-        if (*p == '{')
+        if (state == S_OUTSIDE && strstr(p, "\"entries\":") != NULL)
         {
-            brace_count++;
-            /* Only create entry if brace_count indicates we're in an entry (not outer object) */
-            if (brace_count >= 2 && current == NULL && count < max_entries)
-            {
-                current = &out_entries[count];
-                memset(current, 0, sizeof(*current));
-                in_entry = 1;
-            }
+            state = S_IN_ENTRIES;
             continue;
         }
 
-        /* Detect closing brace */
-        if (*p == '}')
+        if (state == S_IN_ENTRIES && *p == '{')
         {
-            if (current != NULL && in_entry && brace_count >= 2)
-            {
-                count++;
-                current = NULL;
-                in_entry = 0;
-            }
-            brace_count--;
+            current = &out_entries[count];
+            memset(current, 0, sizeof(*current));
+            state = S_IN_ENTRY;
             continue;
         }
 
-        if (!current || !in_entry)
+        if (state == S_IN_ENTRY && *p == '}')
+        {
+            count++;
+            current = NULL;
+            state = S_IN_ENTRIES;
+            continue;
+        }
+
+        if ((state == S_IN_ENTRIES && (*p == ']' || *p == '}')) ||
+            (state == S_OUTSIDE && *p == '}'))
+        {
+            if (state == S_IN_ENTRIES)
+                state = S_OUTSIDE;
+            continue;
+        }
+
+        if (state != S_IN_ENTRY || !current)
             continue;
 
-        /* Extract fields from current entry */
         if (strstr(p, "\"binary\":") != NULL)
         {
-            if (sscanf(p, " \"binary\": \"%[^\"]\",", val_buf) == 1 ||
-                sscanf(p, " \"binary\": \"%[^\"]\"", val_buf) == 1)
-            {
-                size_t len = strlen(val_buf);
-                memcpy(current->binary, val_buf, len < PATH_MAX - 1 ? len : PATH_MAX - 1);
-                current->binary[len < PATH_MAX - 1 ? len : PATH_MAX - 1] = '\0';
-            }
+            if (sscanf(p, " \"binary\": \"%1023[^\"]\"", val_buf) == 1)
+                snprintf(current->binary, PATH_MAX, "%s", val_buf);
         }
         else if (strstr(p, "\"binary_sha512\":") != NULL)
         {
-            if (sscanf(p, " \"binary_sha512\": \"%[^\"]\",", val_buf) == 1 ||
-                sscanf(p, " \"binary_sha512\": \"%[^\"]\"", val_buf) == 1)
+            if (sscanf(p, " \"binary_sha512\": \"%1023[^\"]\"", val_buf) == 1)
             {
                 size_t len = strlen(val_buf);
-                memcpy(current->binary_sha512, val_buf, len < 127 ? len : 127);
-                current->binary_sha512[len < 127 ? len : 127] = '\0';
+                if (len >= sizeof(current->binary_sha512))
+                    len = sizeof(current->binary_sha512) - 1;
+                memcpy(current->binary_sha512, val_buf, len);
+                current->binary_sha512[len] = '\0';
             }
         }
         else if (strstr(p, "\"chain_depth\":") != NULL)
         {
-            sscanf(p, " \"chain_depth\": %d,", &current->chain_depth);
+            sscanf(p, " \"chain_depth\": %d", &current->chain_depth);
         }
-        else if (strstr(p, "\"chain_comm\":") != NULL)
+        else if (strstr(p, "\"created_at\":") != NULL)
         {
-            in_chain_comm = 1;
-            chain_idx = 0;
-            continue;
+            long tmp;
+            if (sscanf(p, " \"created_at\": %ld", &tmp) == 1)
+                current->created_at = (time_t)tmp;
         }
-        else if (strstr(p, "\"chain_sha512\":") != NULL)
+        else
         {
-            in_chain_sha = 1;
-            chain_idx = 0;
-            continue;
-        }
-        else if (in_chain_comm && (strstr(p, "],") != NULL || strstr(p, "]") != NULL))
-        {
-            in_chain_comm = 0;
-        }
-        else if (in_chain_sha && strstr(p, "]") != NULL)
-        {
-            in_chain_sha = 0;
-        }
-        else if (in_chain_comm && sscanf(p, " \"%[^\"]\",", val_buf) == 1)
-        {
-            if (chain_idx < PERSIST_CHAIN_MAX)
+            int idx;
+            if (sscanf(p, " \"chain_comm[%d]\": \"%1023[^\"]\"", &idx, val_buf) == 2)
             {
-                size_t len = strlen(val_buf);
-                memcpy(current->chain_comm[chain_idx], val_buf, len < 254 ? len : 254);
-                current->chain_comm[chain_idx][len < 254 ? len : 254] = '\0';
-                chain_idx++;
+                if (idx >= 0 && idx < PERSIST_CHAIN_MAX)
+                {
+                    size_t len = strlen(val_buf);
+                    if (len >= sizeof(current->chain_comm[idx]))
+                        len = sizeof(current->chain_comm[idx]) - 1;
+                    memcpy(current->chain_comm[idx], val_buf, len);
+                    current->chain_comm[idx][len] = '\0';
+                }
             }
-        }
-        else if (in_chain_sha && sscanf(p, " \"%[^\"]\",", val_buf) == 1)
-        {
-            if (chain_idx < PERSIST_CHAIN_MAX)
+            else if (sscanf(p, " \"chain_sha512[%d]\": \"%1023[^\"]\"", &idx, val_buf) == 2)
             {
-                size_t len = strlen(val_buf);
-                memcpy(current->chain_sha512[chain_idx], val_buf, len < 127 ? len : 127);
-                current->chain_sha512[chain_idx][len < 127 ? len : 127] = '\0';
-                chain_idx++;
-            }
-        }
-        else if (in_chain_sha && sscanf(p, " \"%[^\"]\"", val_buf) == 1)
-        {
-            /* Last element without comma */
-            if (chain_idx < PERSIST_CHAIN_MAX)
-            {
-                size_t len = strlen(val_buf);
-                memcpy(current->chain_sha512[chain_idx], val_buf, len < 127 ? len : 127);
-                current->chain_sha512[chain_idx][len < 127 ? len : 127] = '\0';
-                chain_idx++;
+                if (idx >= 0 && idx < PERSIST_CHAIN_MAX)
+                {
+                    size_t len = strlen(val_buf);
+                    if (len >= sizeof(current->chain_sha512[idx]))
+                        len = sizeof(current->chain_sha512[idx]) - 1;
+                    memcpy(current->chain_sha512[idx], val_buf, len);
+                    current->chain_sha512[idx][len] = '\0';
+                }
             }
         }
     }
