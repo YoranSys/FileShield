@@ -106,12 +106,56 @@ static void test_unknown_section(void)
     free(path);
 }
 
+static void test_settings_user_ttl(void)
+{
+    const char *conf =
+        "[settings]\n"
+        "user_ttl = 120\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for settings");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int r = config_load(path, &cfg);
+    ASSERT(r == 0, "config_load settings success");
+    ASSERT(cfg.user_ttl_seconds == 120, "user_ttl parsed correctly");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
+static void test_settings_invalid_user_ttl(void)
+{
+    const char *conf =
+        "[settings]\n"
+        "user_ttl = -5\n";
+
+    char *path = write_temp(conf);
+    ASSERT(path != NULL, "write temp config for invalid settings");
+
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.user_ttl_seconds = 0; /* default — should stay 0 on invalid value */
+
+    config_load(path, &cfg);
+    ASSERT(cfg.user_ttl_seconds == 0, "invalid user_ttl not applied");
+
+    config_reset(&cfg);
+    unlink(path);
+    free(path);
+}
+
 int main(void)
 {
     printf("=== test_config ===\n");
     test_basic_parse();
     test_missing_file();
     test_unknown_section();
+    test_settings_user_ttl();
+    test_settings_invalid_user_ttl();
     if (failures)
     {
         fprintf(stderr, "%d test(s) failed\n", failures);

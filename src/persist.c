@@ -11,29 +11,29 @@
 #include "utils.h"
 
 /* Ensure the state directory exists with secure permissions (0700, root-only). */
-static int ensure_state_dir(void)
+static int ensure_state_dir(const char *dirpath)
 {
     struct stat st;
 
-    if (stat(PERSIST_STATE_DIR, &st) == 0)
+    if (stat(dirpath, &st) == 0)
     {
         if (!S_ISDIR(st.st_mode))
         {
-            log_msg(LOG_ERR, "%s exists but is not a directory", PERSIST_STATE_DIR);
+            log_msg(LOG_ERR, "%s exists but is not a directory", dirpath);
             return -1;
         }
         return 0;
     }
 
-    if (mkdir(PERSIST_STATE_DIR, 0700) < 0)
+    if (mkdir(dirpath, 0700) < 0)
     {
-        log_msg(LOG_ERR, "mkdir %s: %s", PERSIST_STATE_DIR, strerror(errno));
+        log_msg(LOG_ERR, "mkdir %s: %s", dirpath, strerror(errno));
         return -1;
     }
 
-    if (chmod(PERSIST_STATE_DIR, 0700) < 0)
+    if (chmod(dirpath, 0700) < 0)
     {
-        log_msg(LOG_WARNING, "chmod %s: %s", PERSIST_STATE_DIR, strerror(errno));
+        log_msg(LOG_WARNING, "chmod %s: %s", dirpath, strerror(errno));
     }
 
     return 0;
@@ -196,7 +196,12 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
     PersistEntry *current = NULL;
     int count = 0;
 
-    enum { S_OUTSIDE, S_IN_ENTRIES, S_IN_ENTRY } state = S_OUTSIDE;
+    enum
+    {
+        S_OUTSIDE,
+        S_IN_ENTRIES,
+        S_IN_ENTRY
+    } state = S_OUTSIDE;
 
     if (!out_entries || max_entries <= 0)
         return 0;
@@ -267,9 +272,11 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
         if (state != S_IN_ENTRY || !current)
             continue;
 
-        /* Parse key-value pairs with field-width limits. */
+        /* Parse key-value pairs with field-width limits.
+         * Patterns intentionally omit the trailing comma so they match
+         * both "value",  and  "value"  (last field before closing brace). */
         char key_buf[256], val_buf[1024];
-        if (sscanf(p, " \"%255[^\"]\": \"%1023[^\"]\",", key_buf, val_buf) == 2)
+        if (sscanf(p, " \"%255[^\"]\": \"%1023[^\"]\"", key_buf, val_buf) == 2)
         {
             if (json_unescape_string(val_buf) < 0)
             {
@@ -287,23 +294,25 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
                 current->binary_sha512[len] = '\0';
             }
         }
-        else if (sscanf(p, " \"%255[^\"]\": %d,", key_buf, &current->chain_depth) == 2)
-        {
-            continue;
-        }
         else
         {
+            int tmp_int;
             long created_tmp;
-            if (sscanf(p, " \"%255[^\"]\": %ld,", key_buf, &created_tmp) == 2 &&
-                strcmp(key_buf, "created_at") == 0)
+            if (sscanf(p, " \"%255[^\"]\": %d", key_buf, &tmp_int) == 2 &&
+                strcmp(key_buf, "chain_depth") == 0)
+            {
+                current->chain_depth = tmp_int;
+            }
+            else if (sscanf(p, " \"%255[^\"]\": %ld", key_buf, &created_tmp) == 2 &&
+                     strcmp(key_buf, "created_at") == 0)
             {
                 current->created_at = (time_t)created_tmp;
-                continue;
             }
         }
 
         int idx;
-        if (sscanf(p, " \"chain_comm[%d]\": \"%1023[^\"]\",", &idx, val_buf) == 2)
+        /* Omit trailing comma in patterns — matches both "value", and "value". */
+        if (sscanf(p, " \"chain_comm[%d]\": \"%1023[^\"]\"", &idx, val_buf) == 2)
         {
             if (idx >= 0 && idx < PERSIST_CHAIN_MAX)
             {
@@ -319,7 +328,7 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
                     log_msg(LOG_WARNING, "persist_load: unescape failed for chain_comm[%d]", idx);
             }
         }
-        else if (sscanf(p, " \"chain_sha512[%d]\": \"%1023[^\"]\",", &idx, val_buf) == 2)
+        else if (sscanf(p, " \"chain_sha512[%d]\": \"%1023[^\"]\"", &idx, val_buf) == 2)
         {
             if (idx >= 0 && idx < PERSIST_CHAIN_MAX)
             {
@@ -353,8 +362,18 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
     if (!entries || count < 0 || count > PERSIST_MAX_ENTRIES)
         return -1;
 
-    if (ensure_state_dir() < 0)
-        return -1;
+    /* Derive the parent directory from filepath and ensure it exists. */
+    {
+        char dirpath[PATH_MAX];
+        snprintf(dirpath, sizeof(dirpath), "%s", filepath);
+        char *slash = strrchr(dirpath, '/');
+        if (slash && slash != dirpath)
+        {
+            *slash = '\0';
+            if (ensure_state_dir(dirpath) < 0)
+                return -1;
+        }
+    }
 
     snprintf(tmp_file, sizeof(tmp_file), "%s.tmp.%d", filepath, (int)getpid());
 
@@ -387,16 +406,16 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
         fprintf(fp, "      \"chain_depth\": %d,\n", e->chain_depth);
         fprintf(fp, "      \"created_at\": %ld,\n", (long)e->created_at);
 
+        /* chain_comm always gets a trailing comma: chain_sha512 fields follow. */
         for (j = 0; j < PERSIST_CHAIN_MAX; j++)
         {
             if (json_escape_string(e->chain_comm[j], escaped, sizeof(escaped)) > 0)
-                fprintf(fp, "      \"chain_comm[%d]\": \"%s\"%s\n", j, escaped,
-                        j < PERSIST_CHAIN_MAX - 1 ? "," : "");
+                fprintf(fp, "      \"chain_comm[%d]\": \"%s\",\n", j, escaped);
             else
-                fprintf(fp, "      \"chain_comm[%d]\": \"\"%s\n", j,
-                        j < PERSIST_CHAIN_MAX - 1 ? "," : "");
+                fprintf(fp, "      \"chain_comm[%d]\": \"\",\n", j);
         }
 
+        /* Last chain_sha512 field has no trailing comma (closes the object). */
         for (j = 0; j < PERSIST_CHAIN_MAX; j++)
         {
             if (json_escape_string(e->chain_sha512[j], escaped, sizeof(escaped)) > 0)

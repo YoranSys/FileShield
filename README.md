@@ -35,13 +35,14 @@ Process syscall: open("/home/user/.aws/credentials", O_RDONLY)
   ├─ allowlist cache hit?  ─yes─▶  instant FAN_ALLOW
   └─ unknown process?      ─yes─▶  show GUI popup
                                         │
-                              ┌─────────┴─────────┐
-                           Allow               Deny
-                              │                   │
-                        FAN_ALLOW            FAN_DENY
-                        + cache TTL
-                              │
-                        syscall resumes (or fails with EPERM)
+              ┌──────────────┬──────────┴────────┬──────────────────┐
+           Allow Once   Always Allow           Deny            Always Deny
+              │               │                  │                   │
+        FAN_ALLOW        FAN_ALLOW          FAN_DENY             FAN_DENY
+        + cache TTL    + persist to         (one-off)          + persist to
+                      allowlist.json                           denylist.json
+              │
+        syscall resumes (or fails with EPERM)
 ```
 
 ---
@@ -86,7 +87,11 @@ Edit `fileshield.conf` to adjust protected paths or the allowlist, then reload:
 
 ```bash
 sudo systemctl reload fileshield
+# or equivalently:
+sudo kill -HUP $(pidof fileshield)
 ```
+
+Sending `SIGHUP` to the daemon causes it to re-read `fileshield.conf`, remove old fanotify marks, and re-register the new set — without losing the in-memory allow/deny lists.
 
 ### Default Protected Paths
 
@@ -127,7 +132,6 @@ FileShield ships with the following paths protected out of the box:
 
 # --- SCM tokens ---
 ~/.config/gh/hosts.yml
-~/.gitconfig
 
 # --- General ---
 ~/.netrc

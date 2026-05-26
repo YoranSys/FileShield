@@ -5,384 +5,302 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <limits.h>
+#include <time.h>
 
 #include "../src/persist.h"
 
-/* Use /tmp for testing instead of /var/lib/fileshield */
-static char test_state_file[256];
-static char test_state_dir[256];
+/* All tests write to a temp directory under /tmp to avoid needing root. */
+static char g_test_dir[256];
 
-#define TEST_FAIL(msg) \
-    do { \
+#define TEST_FAIL(msg)                      \
+    do                                      \
+    {                                       \
         fprintf(stderr, "FAIL: %s\n", msg); \
-        return 1; \
+        return 1;                           \
     } while (0)
 
-#define TEST_PASS(msg) \
-    do { \
+#define TEST_PASS(msg)                      \
+    do                                      \
+    {                                       \
         fprintf(stdout, "PASS: %s\n", msg); \
     } while (0)
 
-#define ASSERT(cond, msg) \
-    do { \
-        if (!(cond)) { \
+#define ASSERT(cond, msg)   \
+    do                      \
+    {                       \
+        if (!(cond))        \
             TEST_FAIL(msg); \
-        } \
     } while (0)
 
-/*
- * Helper: override the PERSIST_STATE_FILE by creating a mock JSON save function.
- * Since we can't easily override macro constants, we'll write directly to a temp file.
- */
+/* ------------------------------------------------------------------ */
+/*  helpers                                                            */
+/* ------------------------------------------------------------------ */
 
-static int test_persist_save_mock(const PersistEntry *entries, int count, const char *filename)
+static void make_test_path(char *out, size_t sz, const char *name)
 {
-    FILE *fp;
-    int i, j;
-    char tmp_file[PATH_MAX];
-
-    if (!entries || count < 0 || count > PERSIST_MAX_ENTRIES)
-        return -1;
-
-    /* Ensure directory exists */
-    snprintf(test_state_dir, sizeof(test_state_dir), "/tmp/fileshield_test");
-    if (mkdir(test_state_dir, 0700) < 0 && errno != EEXIST)
-        return -1;
-
-    /* Write to temporary file */
-    snprintf(tmp_file, sizeof(tmp_file), "%s.tmp.%d", filename, (int)getpid());
-
-    fp = fopen(tmp_file, "w");
-    if (!fp)
-        return -1;
-
-    fprintf(fp, "{\n");
-    fprintf(fp, "  \"entries\": [\n");
-
-    for (i = 0; i < count; i++)
-    {
-        const PersistEntry *e = &entries[i];
-        fprintf(fp, "    {\n");
-        fprintf(fp, "      \"binary\": \"%s\",\n", e->binary);
-        fprintf(fp, "      \"binary_sha512\": \"%s\",\n", e->binary_sha512);
-        fprintf(fp, "      \"chain_depth\": %d,\n", e->chain_depth);
-        fprintf(fp, "      \"created_at\": %ld,\n", (long)e->created_at);
-        for (j = 0; j < PERSIST_CHAIN_MAX; j++)
-            fprintf(fp, "      \"chain_comm[%d]\": \"%s\"%s\n",
-                    j, e->chain_comm[j], j < PERSIST_CHAIN_MAX - 1 ? "," : "");
-        for (j = 0; j < PERSIST_CHAIN_MAX; j++)
-            fprintf(fp, "      \"chain_sha512[%d]\": \"%s\"%s\n",
-                    j, e->chain_sha512[j], j < PERSIST_CHAIN_MAX - 1 ? "," : "");
-        fprintf(fp, "    }%s\n", i < count - 1 ? "," : "");
-    }
-
-    fprintf(fp, "  ]\n");
-    fprintf(fp, "}\n");
-
-    if (fclose(fp) < 0)
-    {
-        unlink(tmp_file);
-        return -1;
-    }
-
-    if (chmod(tmp_file, 0600) < 0)
-    {
-        unlink(tmp_file);
-        return -1;
-    }
-
-    if (rename(tmp_file, filename) < 0)
-    {
-        unlink(tmp_file);
-        return -1;
-    }
-
-    return 0;
+    snprintf(out, sz, "%s/%s", g_test_dir, name);
 }
 
-static int test_persist_load_mock(PersistEntry *out_entries, int max_entries, const char *filename)
-{
-    FILE *fp;
-    char line[4096];
-    PersistEntry *current = NULL;
-    int count = 0;
-    enum { S_OUTSIDE, S_IN_ENTRIES, S_IN_ENTRY } state = S_OUTSIDE;
+/* ------------------------------------------------------------------ */
+/*  test: basic roundtrip using real persist_save / persist_load      */
+/* ------------------------------------------------------------------ */
 
-    if (!out_entries || max_entries <= 0)
-        return 0;
-
-    memset(out_entries, 0, sizeof(*out_entries) * max_entries);
-
-    fp = fopen(filename, "r");
-    if (!fp)
-    {
-        if (errno == ENOENT)
-            return 0;
-        return -1;
-    }
-
-    while (fgets(line, sizeof(line), fp) && count < max_entries)
-    {
-        char *p = line;
-        char val_buf[1024];
-
-        while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-            p++;
-
-        if (!*p || *p == '#')
-            continue;
-
-        if (state == S_OUTSIDE && strstr(p, "\"entries\":") != NULL)
-        {
-            state = S_IN_ENTRIES;
-            continue;
-        }
-
-        if (state == S_IN_ENTRIES && *p == '{')
-        {
-            current = &out_entries[count];
-            memset(current, 0, sizeof(*current));
-            state = S_IN_ENTRY;
-            continue;
-        }
-
-        if (state == S_IN_ENTRY && *p == '}')
-        {
-            count++;
-            current = NULL;
-            state = S_IN_ENTRIES;
-            continue;
-        }
-
-        if ((state == S_IN_ENTRIES && (*p == ']' || *p == '}')) ||
-            (state == S_OUTSIDE && *p == '}'))
-        {
-            if (state == S_IN_ENTRIES)
-                state = S_OUTSIDE;
-            continue;
-        }
-
-        if (state != S_IN_ENTRY || !current)
-            continue;
-
-        if (strstr(p, "\"binary\":") != NULL)
-        {
-            if (sscanf(p, " \"binary\": \"%1023[^\"]\"", val_buf) == 1)
-                snprintf(current->binary, PATH_MAX, "%s", val_buf);
-        }
-        else if (strstr(p, "\"binary_sha512\":") != NULL)
-        {
-            if (sscanf(p, " \"binary_sha512\": \"%1023[^\"]\"", val_buf) == 1)
-            {
-                size_t len = strlen(val_buf);
-                if (len >= sizeof(current->binary_sha512))
-                    len = sizeof(current->binary_sha512) - 1;
-                memcpy(current->binary_sha512, val_buf, len);
-                current->binary_sha512[len] = '\0';
-            }
-        }
-        else if (strstr(p, "\"chain_depth\":") != NULL)
-        {
-            sscanf(p, " \"chain_depth\": %d", &current->chain_depth);
-        }
-        else if (strstr(p, "\"created_at\":") != NULL)
-        {
-            long tmp;
-            if (sscanf(p, " \"created_at\": %ld", &tmp) == 1)
-                current->created_at = (time_t)tmp;
-        }
-        else
-        {
-            int idx;
-            if (sscanf(p, " \"chain_comm[%d]\": \"%1023[^\"]\"", &idx, val_buf) == 2)
-            {
-                if (idx >= 0 && idx < PERSIST_CHAIN_MAX)
-                {
-                    size_t len = strlen(val_buf);
-                    if (len >= sizeof(current->chain_comm[idx]))
-                        len = sizeof(current->chain_comm[idx]) - 1;
-                    memcpy(current->chain_comm[idx], val_buf, len);
-                    current->chain_comm[idx][len] = '\0';
-                }
-            }
-            else if (sscanf(p, " \"chain_sha512[%d]\": \"%1023[^\"]\"", &idx, val_buf) == 2)
-            {
-                if (idx >= 0 && idx < PERSIST_CHAIN_MAX)
-                {
-                    size_t len = strlen(val_buf);
-                    if (len >= sizeof(current->chain_sha512[idx]))
-                        len = sizeof(current->chain_sha512[idx]) - 1;
-                    memcpy(current->chain_sha512[idx], val_buf, len);
-                    current->chain_sha512[idx][len] = '\0';
-                }
-            }
-        }
-    }
-
-    fclose(fp);
-    return count;
-}
-
-/* Test: basic save and load roundtrip */
 static int test_persist_roundtrip(void)
 {
-    PersistEntry entries_in[2];
-    PersistEntry entries_out[PERSIST_MAX_ENTRIES];
-    int count;
+    char path[PATH_MAX];
+    make_test_path(path, sizeof(path), "roundtrip.json");
+    unlink(path);
 
-    snprintf(test_state_file, sizeof(test_state_file), "/tmp/fileshield_test/test_state.json");
+    PersistEntry in[2];
+    memset(in, 0, sizeof(in));
 
-    /* Remove any existing state file */
-    unlink(test_state_file);
+    /* Entry 0: chain depth 2 */
+    snprintf(in[0].binary, sizeof(in[0].binary), "/usr/bin/git");
+    snprintf(in[0].binary_sha512, sizeof(in[0].binary_sha512),
+             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    in[0].chain_depth = 2;
+    snprintf(in[0].chain_comm[0], sizeof(in[0].chain_comm[0]), "code");
+    snprintf(in[0].chain_sha512[0], sizeof(in[0].chain_sha512[0]),
+             "1111111111111111111111111111111111111111111111111111111111111111"
+             "1111111111111111111111111111111111111111111111111111111111111111");
+    snprintf(in[0].chain_comm[1], sizeof(in[0].chain_comm[1]), "systemd");
+    snprintf(in[0].chain_sha512[1], sizeof(in[0].chain_sha512[1]),
+             "2222222222222222222222222222222222222222222222222222222222222222"
+             "2222222222222222222222222222222222222222222222222222222222222222");
+    in[0].created_at = (time_t)1700000000;
 
-    /* Prepare test entries */
-    memset(entries_in, 0, sizeof(entries_in));
+    /* Entry 1: chain depth 1 */
+    snprintf(in[1].binary, sizeof(in[1].binary), "/usr/bin/ssh");
+    snprintf(in[1].binary_sha512, sizeof(in[1].binary_sha512),
+             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    in[1].chain_depth = 1;
+    snprintf(in[1].chain_comm[0], sizeof(in[1].chain_comm[0]), "bash");
+    snprintf(in[1].chain_sha512[0], sizeof(in[1].chain_sha512[0]),
+             "3333333333333333333333333333333333333333333333333333333333333333"
+             "3333333333333333333333333333333333333333333333333333333333333333");
+    in[1].created_at = (time_t)1700001000;
 
-    snprintf(entries_in[0].binary, sizeof(entries_in[0].binary), "/usr/bin/git");
-    snprintf(entries_in[0].binary_sha512, sizeof(entries_in[0].binary_sha512),
-             "abc123def456abc123def456abc123def456abc123def456abc123def456abc1");
-    entries_in[0].chain_depth = 2;
-    snprintf(entries_in[0].chain_comm[0], sizeof(entries_in[0].chain_comm[0]), "code");
-    snprintf(entries_in[0].chain_sha512[0], sizeof(entries_in[0].chain_sha512[0]),
-             "111111111111111111111111111111111111111111111111111111111111111");
-    snprintf(entries_in[0].chain_comm[1], sizeof(entries_in[0].chain_comm[1]), "systemd");
-    snprintf(entries_in[0].chain_sha512[1], sizeof(entries_in[0].chain_sha512[1]),
-             "222222222222222222222222222222222222222222222222222222222222222");
+    ASSERT(persist_save(path, in, 2) == 0, "persist_save returned 0");
 
-    snprintf(entries_in[1].binary, sizeof(entries_in[1].binary), "/usr/bin/ssh");
-    snprintf(entries_in[1].binary_sha512, sizeof(entries_in[1].binary_sha512),
-             "xyz789abc123xyz789abc123xyz789abc123xyz789abc123xyz789abc123xyz78");
-    entries_in[1].chain_depth = 1;
-    snprintf(entries_in[1].chain_comm[0], sizeof(entries_in[1].chain_comm[0]), "bash");
-    snprintf(entries_in[1].chain_sha512[0], sizeof(entries_in[1].chain_sha512[0]),
-             "333333333333333333333333333333333333333333333333333333333333333");
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 2, "persist_load returned 2 entries");
 
-    /* Save entries using mock */
-    if (test_persist_save_mock(entries_in, 2, test_state_file) < 0)
-        TEST_FAIL("test_persist_save_mock failed");
+    ASSERT(strcmp(out[0].binary, "/usr/bin/git") == 0, "entry0 binary");
+    ASSERT(strcmp(out[0].binary_sha512, in[0].binary_sha512) == 0, "entry0 sha512");
+    ASSERT(out[0].chain_depth == 2, "entry0 chain_depth");
+    ASSERT(strcmp(out[0].chain_comm[0], "code") == 0, "entry0 chain_comm[0]");
+    ASSERT(strcmp(out[0].chain_comm[1], "systemd") == 0, "entry0 chain_comm[1]");
+    ASSERT(strcmp(out[0].chain_sha512[0], in[0].chain_sha512[0]) == 0,
+           "entry0 chain_sha512[0]");
+    ASSERT(strcmp(out[0].chain_sha512[1], in[0].chain_sha512[1]) == 0,
+           "entry0 chain_sha512[1]");
+    ASSERT(out[0].created_at == (time_t)1700000000, "entry0 created_at");
 
-    /* Load entries using mock */
-    count = test_persist_load_mock(entries_out, PERSIST_MAX_ENTRIES, test_state_file);
-    ASSERT(count == 2, "expected 2 entries loaded");
+    ASSERT(strcmp(out[1].binary, "/usr/bin/ssh") == 0, "entry1 binary");
+    ASSERT(out[1].chain_depth == 1, "entry1 chain_depth");
+    ASSERT(strcmp(out[1].chain_comm[0], "bash") == 0, "entry1 chain_comm[0]");
 
-    /* Verify first entry */
-    ASSERT(strcmp(entries_out[0].binary, "/usr/bin/git") == 0, "entry 0 binary path mismatch");
-    ASSERT(strcmp(entries_out[0].binary_sha512,
-                  "abc123def456abc123def456abc123def456abc123def456abc123def456abc1") == 0,
-           "entry 0 SHA-512 mismatch");
-    ASSERT(entries_out[0].chain_depth == 2, "entry 0 chain depth mismatch");
-    ASSERT(strcmp(entries_out[0].chain_comm[0], "code") == 0, "entry 0 chain_comm[0] mismatch");
-    ASSERT(strcmp(entries_out[0].chain_comm[1], "systemd") == 0, "entry 0 chain_comm[1] mismatch");
-
-    /* Verify second entry */
-    ASSERT(strcmp(entries_out[1].binary, "/usr/bin/ssh") == 0, "entry 1 binary path mismatch");
-    ASSERT(entries_out[1].chain_depth == 1, "entry 1 chain depth mismatch");
-    ASSERT(strcmp(entries_out[1].chain_comm[0], "bash") == 0, "entry 1 chain_comm[0] mismatch");
-
-    /* Clean up */
-    unlink(test_state_file);
-
+    unlink(path);
     TEST_PASS("roundtrip save/load");
     return 0;
 }
 
-/* Test: load from nonexistent file returns 0 */
+/* ------------------------------------------------------------------ */
+/*  test: max chain depth (depth == PERSIST_CHAIN_MAX)                */
+/*  Exercises the formerly-broken chain_comm/sha512[PERSIST_CHAIN_MAX-1] */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_max_chain_depth(void)
+{
+    char path[PATH_MAX];
+    make_test_path(path, sizeof(path), "maxchain.json");
+    unlink(path);
+
+    PersistEntry in[1];
+    memset(in, 0, sizeof(in));
+
+    snprintf(in[0].binary, sizeof(in[0].binary), "/usr/bin/kubectl");
+    in[0].chain_depth = PERSIST_CHAIN_MAX;
+    for (int j = 0; j < PERSIST_CHAIN_MAX; j++)
+    {
+        snprintf(in[0].chain_comm[j], sizeof(in[0].chain_comm[j]), "ancestor%d", j);
+        memset(in[0].chain_sha512[j], '0' + j, 128);
+        in[0].chain_sha512[j][128] = '\0';
+    }
+
+    ASSERT(persist_save(path, in, 1) == 0, "persist_save max chain");
+
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1, "persist_load max chain returns 1");
+    ASSERT(out[0].chain_depth == PERSIST_CHAIN_MAX, "chain_depth == PERSIST_CHAIN_MAX");
+
+    for (int j = 0; j < PERSIST_CHAIN_MAX; j++)
+    {
+        char expected_comm[32];
+        snprintf(expected_comm, sizeof(expected_comm), "ancestor%d", j);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "chain_comm[%d] correct", j);
+        ASSERT(strcmp(out[0].chain_comm[j], expected_comm) == 0, msg);
+        snprintf(msg, sizeof(msg), "chain_sha512[%d] correct", j);
+        ASSERT(strcmp(out[0].chain_sha512[j], in[0].chain_sha512[j]) == 0, msg);
+    }
+
+    unlink(path);
+    TEST_PASS("max chain depth roundtrip");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  test: load from nonexistent file returns 0                        */
+/* ------------------------------------------------------------------ */
+
 static int test_persist_load_nonexistent(void)
 {
-    PersistEntry entries[PERSIST_MAX_ENTRIES];
-    int count;
+    char path[PATH_MAX];
+    make_test_path(path, sizeof(path), "nonexistent.json");
+    unlink(path);
 
-    snprintf(test_state_file, sizeof(test_state_file), "/tmp/fileshield_test/nonexistent.json");
-
-    /* Remove any existing state file */
-    unlink(test_state_file);
-
-    /* Try to load from nonexistent file */
-    count = test_persist_load_mock(entries, PERSIST_MAX_ENTRIES, test_state_file);
-    ASSERT(count == 0, "load from nonexistent file should return 0");
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 0, "load nonexistent returns 0");
 
     TEST_PASS("load nonexistent file");
     return 0;
 }
 
-/* Test: empty entries save */
+/* ------------------------------------------------------------------ */
+/*  test: save zero entries, reload returns 0                         */
+/* ------------------------------------------------------------------ */
+
 static int test_persist_save_empty(void)
 {
-    PersistEntry entries_out[PERSIST_MAX_ENTRIES];
-    int count;
+    char path[PATH_MAX];
+    make_test_path(path, sizeof(path), "empty.json");
+    unlink(path);
 
-    snprintf(test_state_file, sizeof(test_state_file), "/tmp/fileshield_test/empty.json");
+    PersistEntry dummy[1];
+    memset(dummy, 0, sizeof(dummy));
+    ASSERT(persist_save(path, dummy, 0) == 0, "persist_save 0 entries");
 
-    /* Remove any existing state file */
-    unlink(test_state_file);
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 0, "persist_load after empty save returns 0");
 
-    /* Save 0 entries */
-    if (test_persist_save_mock(NULL, 0, test_state_file) < 0)
-    {
-        /* Null entries with 0 count should be OK */
-    }
-
-    PersistEntry temp[1] = {0};
-    if (test_persist_save_mock(temp, 0, test_state_file) < 0)
-        TEST_FAIL("test_persist_save_mock with empty entries failed");
-
-    /* Load should return 0 */
-    count = test_persist_load_mock(entries_out, PERSIST_MAX_ENTRIES, test_state_file);
-    ASSERT(count == 0, "load after saving empty should return 0");
-
-    /* Clean up */
-    unlink(test_state_file);
-
+    unlink(path);
     TEST_PASS("save empty entries");
     return 0;
 }
 
-/* Test: chain depth variations */
+/* ------------------------------------------------------------------ */
+/*  test: chain depth variations (1..PERSIST_CHAIN_MAX)               */
+/* ------------------------------------------------------------------ */
+
 static int test_persist_chain_depths(void)
 {
-    PersistEntry entries_in[PERSIST_CHAIN_MAX];
-    PersistEntry entries_out[PERSIST_MAX_ENTRIES];
-    int i, count;
+    char path[PATH_MAX];
+    make_test_path(path, sizeof(path), "chains.json");
+    unlink(path);
 
-    snprintf(test_state_file, sizeof(test_state_file), "/tmp/fileshield_test/chains.json");
+    PersistEntry in[PERSIST_CHAIN_MAX];
+    memset(in, 0, sizeof(in));
 
-    /* Remove any existing state file */
-    unlink(test_state_file);
-
-    /* Create entries with different chain depths */
-    memset(entries_in, 0, sizeof(entries_in));
-
-    for (i = 0; i < PERSIST_CHAIN_MAX; i++)
+    for (int i = 0; i < PERSIST_CHAIN_MAX; i++)
     {
-        snprintf(entries_in[i].binary, sizeof(entries_in[i].binary), "/usr/bin/chain%d", i);
-        entries_in[i].chain_depth = i + 1;
+        snprintf(in[i].binary, sizeof(in[i].binary), "/usr/bin/chain%d", i);
+        in[i].chain_depth = i + 1;
+        for (int j = 0; j <= i; j++)
+            snprintf(in[i].chain_comm[j], sizeof(in[i].chain_comm[j]), "proc%d", j);
+    }
+
+    ASSERT(persist_save(path, in, PERSIST_CHAIN_MAX) == 0, "persist_save chain depths");
+
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == PERSIST_CHAIN_MAX, "persist_load chain depths count");
+
+    for (int i = 0; i < PERSIST_CHAIN_MAX; i++)
+    {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "entry %d chain_depth", i);
+        ASSERT(out[i].chain_depth == i + 1, msg);
         for (int j = 0; j <= i; j++)
         {
-            snprintf(entries_in[i].chain_comm[j], sizeof(entries_in[i].chain_comm[j]), "proc%d",
-                     j);
+            char expected[32];
+            snprintf(expected, sizeof(expected), "proc%d", j);
+            snprintf(msg, sizeof(msg), "entry %d chain_comm[%d]", i, j);
+            ASSERT(strcmp(out[i].chain_comm[j], expected) == 0, msg);
         }
     }
 
-    /* Save and load */
-    if (test_persist_save_mock(entries_in, PERSIST_CHAIN_MAX, test_state_file) < 0)
-        TEST_FAIL("test_persist_save_mock with chain depths failed");
-
-    count = test_persist_load_mock(entries_out, PERSIST_MAX_ENTRIES, test_state_file);
-    ASSERT(count == PERSIST_CHAIN_MAX, "expected all chain entries loaded");
-
-    for (i = 0; i < PERSIST_CHAIN_MAX; i++)
-    {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "entry %d chain depth mismatch", i);
-        ASSERT(entries_out[i].chain_depth == i + 1, buf);
-    }
-
-    /* Clean up */
-    unlink(test_state_file);
-
+    unlink(path);
     TEST_PASS("chain depth variations");
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/*  test: JSON special characters are escaped and restored            */
+/*  Note: sscanf %[^\"] cannot parse escaped quotes inside values;    */
+/*  this is acceptable because Linux paths and proc comm names never  */
+/*  contain '"'. Only backslash (unusual but valid in paths) is       */
+/*  tested here.                                                       */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_json_escaping(void)
+{
+    char path[PATH_MAX];
+    make_test_path(path, sizeof(path), "escape.json");
+    unlink(path);
+
+    PersistEntry in[1];
+    memset(in, 0, sizeof(in));
+
+    /* A backslash in a binary path: unusual but valid on Linux. */
+    snprintf(in[0].binary, sizeof(in[0].binary), "/usr/bin/my\\tool");
+    in[0].chain_depth = 1;
+    snprintf(in[0].chain_comm[0], sizeof(in[0].chain_comm[0]), "normalproc");
+
+    ASSERT(persist_save(path, in, 1) == 0, "persist_save escaped chars");
+
+    PersistEntry out[PERSIST_MAX_ENTRIES];
+    int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
+    ASSERT(n == 1, "persist_load escaped chars returns 1");
+    ASSERT(strcmp(out[0].binary, "/usr/bin/my\\tool") == 0,
+           "binary backslash roundtrip");
+    ASSERT(strcmp(out[0].chain_comm[0], "normalproc") == 0,
+           "chain_comm normal name roundtrip");
+
+    unlink(path);
+    TEST_PASS("JSON special character escaping");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  test: persist_delete                                               */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_delete(void)
+{
+    char path[PATH_MAX];
+    make_test_path(path, sizeof(path), "delete_me.json");
+    unlink(path);
+
+    PersistEntry dummy[1];
+    memset(dummy, 0, sizeof(dummy));
+    ASSERT(persist_save(path, dummy, 0) == 0, "persist_save for delete test");
+    ASSERT(persist_delete(path) == 0, "persist_delete existing file");
+    ASSERT(persist_delete(path) == 0, "persist_delete nonexistent is ok");
+
+    TEST_PASS("persist_delete");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  main                                                               */
+/* ------------------------------------------------------------------ */
 
 int main(void)
 {
@@ -390,22 +308,30 @@ int main(void)
 
     fprintf(stdout, "=== test_persist ===\n");
 
+    /* Per-run temp directory avoids the need for root access. */
+    snprintf(g_test_dir, sizeof(g_test_dir), "/tmp/fileshield_test_%d", (int)getpid());
+    if (mkdir(g_test_dir, 0700) < 0 && errno != EEXIST)
+    {
+        fprintf(stderr, "FAIL: could not create temp dir %s: %s\n",
+                g_test_dir, strerror(errno));
+        return 1;
+    }
+
     failed |= test_persist_load_nonexistent();
     failed |= test_persist_roundtrip();
+    failed |= test_persist_max_chain_depth();
     failed |= test_persist_save_empty();
     failed |= test_persist_chain_depths();
+    failed |= test_persist_json_escaping();
+    failed |= test_persist_delete();
 
-    /* Clean up temp directory */
-    rmdir("/tmp/fileshield_test");
+    rmdir(g_test_dir);
 
     if (failed)
     {
         fprintf(stdout, "FAIL\n");
         return 1;
     }
-    else
-    {
-        fprintf(stdout, "PASS\n");
-        return 0;
-    }
+    fprintf(stdout, "PASS\n");
+    return 0;
 }
