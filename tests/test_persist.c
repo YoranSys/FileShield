@@ -12,6 +12,11 @@
 /* All tests write to a temp directory under /tmp to avoid needing root. */
 static char g_test_dir[256];
 
+static void make_test_path(char *out, size_t sz, const char *name)
+{
+    snprintf(out, sz, "%s/%s", g_test_dir, name);
+}
+
 #define TEST_FAIL(msg)                      \
     do                                      \
     {                                       \
@@ -33,17 +38,13 @@ static char g_test_dir[256];
     } while (0)
 
 /* ------------------------------------------------------------------ */
-/*  helpers                                                            */
+/*  test: persist_remove_key                                           */
 /* ------------------------------------------------------------------ */
 
-static void make_test_path(char *out, size_t sz, const char *name)
-{
-    snprintf(out, sz, "%s/%s", g_test_dir, name);
-}
-
-/* ------------------------------------------------------------------ */
-/*  test: basic roundtrip using real persist_save / persist_load      */
-/* ------------------------------------------------------------------ */
+/* Pre-counted SHA-512 test values (62 hex chars, within 128-char limit) */
+#define SHA_GIT "aaaa1111111111111111111111111111111111111111111111111111111111"
+#define SHA_VIM "bbbb2222222222222222222222222222222222222222222222222222222222"
+#define SHA_SSH "cccc3333333333333333333333333333333333333333333333333333333333"
 
 static int test_persist_roundtrip(void)
 {
@@ -59,6 +60,7 @@ static int test_persist_roundtrip(void)
     snprintf(in[0].binary_sha512, sizeof(in[0].binary_sha512),
              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    snprintf(in[0].target_path, sizeof(in[0].target_path), "/home/user/.ssh/id_rsa");
     in[0].chain_depth = 2;
     snprintf(in[0].chain_comm[0], sizeof(in[0].chain_comm[0]), "code");
     snprintf(in[0].chain_sha512[0], sizeof(in[0].chain_sha512[0]),
@@ -75,6 +77,7 @@ static int test_persist_roundtrip(void)
     snprintf(in[1].binary_sha512, sizeof(in[1].binary_sha512),
              "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
              "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    snprintf(in[1].target_path, sizeof(in[1].target_path), "/etc/ssl/private/key.pem");
     in[1].chain_depth = 1;
     snprintf(in[1].chain_comm[0], sizeof(in[1].chain_comm[0]), "bash");
     snprintf(in[1].chain_sha512[0], sizeof(in[1].chain_sha512[0]),
@@ -90,6 +93,7 @@ static int test_persist_roundtrip(void)
 
     ASSERT(strcmp(out[0].binary, "/usr/bin/git") == 0, "entry0 binary");
     ASSERT(strcmp(out[0].binary_sha512, in[0].binary_sha512) == 0, "entry0 sha512");
+    ASSERT(strcmp(out[0].target_path, "/home/user/.ssh/id_rsa") == 0, "entry0 target_path");
     ASSERT(out[0].chain_depth == 2, "entry0 chain_depth");
     ASSERT(strcmp(out[0].chain_comm[0], "code") == 0, "entry0 chain_comm[0]");
     ASSERT(strcmp(out[0].chain_comm[1], "systemd") == 0, "entry0 chain_comm[1]");
@@ -100,6 +104,7 @@ static int test_persist_roundtrip(void)
     ASSERT(out[0].created_at == (time_t)1700000000, "entry0 created_at");
 
     ASSERT(strcmp(out[1].binary, "/usr/bin/ssh") == 0, "entry1 binary");
+    ASSERT(strcmp(out[1].target_path, "/etc/ssl/private/key.pem") == 0, "entry1 target_path");
     ASSERT(out[1].chain_depth == 1, "entry1 chain_depth");
     ASSERT(strcmp(out[1].chain_comm[0], "bash") == 0, "entry1 chain_comm[0]");
 
@@ -123,6 +128,7 @@ static int test_persist_max_chain_depth(void)
     memset(in, 0, sizeof(in));
 
     snprintf(in[0].binary, sizeof(in[0].binary), "/usr/bin/kubectl");
+    snprintf(in[0].target_path, sizeof(in[0].target_path), "/var/run/secrets/tls.crt");
     in[0].chain_depth = PERSIST_CHAIN_MAX;
     for (int j = 0; j < PERSIST_CHAIN_MAX; j++)
     {
@@ -137,6 +143,7 @@ static int test_persist_max_chain_depth(void)
     int n = persist_load(path, out, PERSIST_MAX_ENTRIES);
     ASSERT(n == 1, "persist_load max chain returns 1");
     ASSERT(out[0].chain_depth == PERSIST_CHAIN_MAX, "chain_depth == PERSIST_CHAIN_MAX");
+    ASSERT(strcmp(out[0].target_path, "/var/run/secrets/tls.crt") == 0, "max chain target_path");
 
     for (int j = 0; j < PERSIST_CHAIN_MAX; j++)
     {
@@ -211,6 +218,7 @@ static int test_persist_chain_depths(void)
     for (int i = 0; i < PERSIST_CHAIN_MAX; i++)
     {
         snprintf(in[i].binary, sizeof(in[i].binary), "/usr/bin/chain%d", i);
+        snprintf(in[i].target_path, sizeof(in[i].target_path), "/etc/target%d.conf", i);
         in[i].chain_depth = i + 1;
         for (int j = 0; j <= i; j++)
             snprintf(in[i].chain_comm[j], sizeof(in[i].chain_comm[j]), "proc%d", j);
@@ -227,6 +235,10 @@ static int test_persist_chain_depths(void)
         char msg[64];
         snprintf(msg, sizeof(msg), "entry %d chain_depth", i);
         ASSERT(out[i].chain_depth == i + 1, msg);
+        char expected_target[64];
+        snprintf(expected_target, sizeof(expected_target), "/etc/target%d.conf", i);
+        snprintf(msg, sizeof(msg), "entry %d target_path", i);
+        ASSERT(strcmp(out[i].target_path, expected_target) == 0, msg);
         for (int j = 0; j <= i; j++)
         {
             char expected[32];
@@ -299,6 +311,56 @@ static int test_persist_delete(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  test: persist_remove_key                                           */
+/* ------------------------------------------------------------------ */
+
+static int test_persist_remove_key(void)
+{
+    char path[PATH_MAX];
+    make_test_path(path, sizeof(path), "remove_key.json");
+    unlink(path);
+
+    PersistEntry in[3];
+    memset(in, 0, sizeof(in));
+
+    snprintf(in[0].binary, sizeof(in[0].binary), "/usr/bin/git");
+    snprintf(in[0].binary_sha512, sizeof(in[0].binary_sha512), SHA_GIT);
+
+    snprintf(in[1].binary, sizeof(in[1].binary), "/usr/bin/vim");
+    snprintf(in[1].binary_sha512, sizeof(in[1].binary_sha512), SHA_VIM);
+
+    snprintf(in[2].binary, sizeof(in[2].binary), "/usr/bin/ssh");
+    snprintf(in[2].binary_sha512, sizeof(in[2].binary_sha512), SHA_SSH);
+
+    ASSERT(persist_save(path, in, 3) == 0, "persist_save for remove_key");
+
+    int r = persist_remove_key(path, "/usr/bin/vim", SHA_VIM);
+    ASSERT(r == 0, "persist_remove_key middle entry");
+
+    PersistEntry out[3];
+    memset(out, 0, sizeof(out));
+    int count = persist_load(path, out, 3);
+    ASSERT(count == 2, "persist_load after remove should have 2 entries");
+    ASSERT(strcmp(out[0].binary, "/usr/bin/git") == 0, "entry 0 is git");
+    ASSERT(strcmp(out[1].binary, "/usr/bin/ssh") == 0, "entry 1 is ssh");
+
+    r = persist_remove_key(path, "/bin/nope",
+                           "00000000000000000000000000000000000000000000000000"
+                           "000000000000000000000000");
+    ASSERT(r == 1, "persist_remove_key nonexistent returns 1");
+
+    ASSERT(persist_remove_key(path, "/usr/bin/git", SHA_GIT) == 0, "remove git");
+    ASSERT(persist_remove_key(path, "/usr/bin/ssh", SHA_SSH) == 0, "remove ssh");
+
+    FILE *fp = fopen(path, "r");
+    ASSERT(fp == NULL, "file deleted when last entry removed");
+    if (fp) fclose(fp);
+
+    TEST_PASS("persist_remove_key");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -324,6 +386,7 @@ int main(void)
     failed |= test_persist_chain_depths();
     failed |= test_persist_json_escaping();
     failed |= test_persist_delete();
+    failed |= test_persist_remove_key();
 
     rmdir(g_test_dir);
 

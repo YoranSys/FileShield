@@ -109,7 +109,8 @@ int main(int argc, char *argv[])
     openlog("fileshield", LOG_PID | LOG_CONS, LOG_DAEMON);
 
     Config *cfg = calloc(1, sizeof(Config));
-    if (!cfg) {
+    if (!cfg)
+    {
         log_msg(LOG_ERR, "out of memory allocating config");
         return EXIT_FAILURE;
     }
@@ -141,6 +142,7 @@ int main(int argc, char *argv[])
         free(cfg);
         return EXIT_FAILURE;
     }
+    notify_set_fan_fd(fan_fd);
 
     for (int i = 0; i < cfg->protected_count; i++)
     {
@@ -184,11 +186,15 @@ int main(int argc, char *argv[])
             g_need_reload = 0;
             log_msg(LOG_INFO, "reloading config");
             Config *new_cfg = calloc(1, sizeof(Config));
-            if (!new_cfg) {
+            if (!new_cfg)
+            {
                 log_msg(LOG_ERR, "out of memory during reload, keeping old config");
-            } else if (config_load(config_path, new_cfg) == 0) {
+            }
+            else if (config_load(config_path, new_cfg) == 0)
+            {
                 /* Remove old marks first so paths present in both configs
                  * are never unprotected (remove-then-add order). */
+                fanotify_clear_marks(fan_fd);
                 for (int i = 0; i < cfg->protected_count; i++)
                     fanotify_remove_mark(fan_fd, cfg->protected[i].path);
                 for (int i = 0; i < new_cfg->protected_count; i++)
@@ -197,9 +203,30 @@ int main(int argc, char *argv[])
                 free(cfg);
                 cfg = new_cfg;
                 g_config = cfg;
-            } else {
+            }
+            else
+            {
                 log_msg(LOG_ERR, "config reload failed, keeping old config");
                 free(new_cfg);
+            }
+            /* Reload persist files so CLI-managed changes take effect. */
+            {
+                PersistEntry *allow_buf = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+                if (allow_buf)
+                {
+                    int n = persist_load(PERSIST_STATE_FILE, allow_buf, PERSIST_MAX_ENTRIES);
+                    if (n >= 0)
+                        fanotify_load_dyn_allowlist(allow_buf, n);
+                    free(allow_buf);
+                }
+                PersistEntry *deny_buf = calloc(PERSIST_MAX_ENTRIES, sizeof(PersistEntry));
+                if (deny_buf)
+                {
+                    int n = persist_load(PERSIST_DENY_STATE_FILE, deny_buf, PERSIST_MAX_ENTRIES);
+                    if (n >= 0)
+                        fanotify_load_dyn_denylist(deny_buf, n);
+                    free(deny_buf);
+                }
             }
             cache_expire();
         }

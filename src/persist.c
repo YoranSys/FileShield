@@ -293,6 +293,14 @@ int persist_load(const char *filepath, PersistEntry *out_entries, int max_entrie
                 memcpy(current->binary_sha512, val_buf, len);
                 current->binary_sha512[len] = '\0';
             }
+            else if (strcmp(key_buf, "target_path") == 0)
+            {
+                size_t len = strlen(val_buf);
+                if (len >= sizeof(current->target_path))
+                    len = sizeof(current->target_path) - 1;
+                memcpy(current->target_path, val_buf, len);
+                current->target_path[len] = '\0';
+            }
         }
         else
         {
@@ -403,6 +411,11 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count)
         else
             fprintf(fp, "      \"binary_sha512\": \"\",\n");
 
+        if (json_escape_string(e->target_path, escaped, sizeof(escaped)) > 0)
+            fprintf(fp, "      \"target_path\": \"%s\",\n", escaped);
+        else
+            fprintf(fp, "      \"target_path\": \"\",\n");
+
         fprintf(fp, "      \"chain_depth\": %d,\n", e->chain_depth);
         fprintf(fp, "      \"created_at\": %ld,\n", (long)e->created_at);
 
@@ -463,4 +476,40 @@ int persist_delete(const char *filepath)
         return -1;
     }
     return 0;
+}
+
+int persist_remove_key(const char *filepath, const char *binary,
+                       const char *binary_sha512)
+{
+    PersistEntry entries[PERSIST_MAX_ENTRIES];
+    int count;
+    int found = 0;
+
+    if (!filepath || !binary || !binary_sha512)
+        return -1;
+
+    count = persist_load(filepath, entries, PERSIST_MAX_ENTRIES);
+    if (count < 0)
+        return -1;
+
+    for (int i = 0; i < count; i++)
+    {
+        if (strcmp(entries[i].binary, binary) == 0 &&
+            strcmp(entries[i].binary_sha512, binary_sha512) == 0)
+        {
+            memmove(&entries[i], &entries[i + 1],
+                    (size_t)(count - i - 1) * sizeof(PersistEntry));
+            count--;
+            found = 1;
+            break;
+        }
+    }
+
+    if (!found)
+        return 1;
+
+    if (count == 0)
+        return persist_delete(filepath) == 0 ? 0 : -1;
+
+    return persist_save(filepath, entries, count);
 }

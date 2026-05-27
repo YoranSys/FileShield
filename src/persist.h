@@ -18,6 +18,7 @@ typedef struct
 {
     char binary[PATH_MAX];
     char binary_sha512[129];
+    char target_path[PATH_MAX];
     char chain_comm[PERSIST_CHAIN_MAX][256];
     char chain_sha512[PERSIST_CHAIN_MAX][129];
     int chain_depth;
@@ -36,5 +37,13 @@ int persist_save(const char *filepath, const PersistEntry *entries, int count);
 
 /* Delete a persistent state file. Used on daemon cleanup. */
 int persist_delete(const char *filepath);
+
+/*
+ * Remove one entry from a persist JSON file, matched by binary path
+ * and SHA-512 hash.  Returns 0 on success, 1 if no matching entry
+ * was found, -1 on error.
+ */
+int persist_remove_key(const char *filepath, const char *binary,
+                       const char *binary_sha512);
 
 #endif

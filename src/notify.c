@@ -1,20 +1,35 @@
 #include <errno.h>
 #include <pwd.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <limits.h>
+#include <poll.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <syslog.h>
 
 #include "notify.h"
+#include "fanotify.h"
 #include "utils.h"
 
 /* UID of the desktop user whose Wayland session we detected. 0 = not found. */
 static uid_t g_session_uid = 0;
+
+/*
+ * Fanotify fd stored here so run_dialog() can pump pending events while
+ * waiting for the dialog child (prevents mount-mark deadlock).
+ */
+static int g_fan_fd = -1;
+
+void notify_set_fan_fd(int fd)
+{
+    g_fan_fd = fd;
+}
 
 /*
  * setup_display_env: scan /run/user/<uid>/ to find an active Wayland session
@@ -180,7 +195,7 @@ static int run_dialog_confirm(const char *bin, const char *text,
     {
         if (ec == 124) /* timeout → safe default */
             return ret_yes;
-        if (ec == 0)   /* Yes / Deny Once */
+        if (ec == 0) /* Yes / Deny Once */
             return ret_yes;
         /* No / Always Deny (ec == 1) or error → explicit user choice */
         return ret_no;
@@ -210,6 +225,7 @@ static int run_dialog(const char *bin, const char *text)
         log_msg(LOG_ERR, "fork failed for %s: %m", bin);
         return -1;
     }
+    log_msg(LOG_DEBUG, "[dialog] forked %s child pid=%d", bin, (int)pid);
 
     if (pid == 0)
     {
@@ -259,22 +275,94 @@ static int run_dialog(const char *bin, const char *text)
         _exit(127);
     }
 
-    /* Parent: close write end, read stdout (for zenity extra-button label). */
+    /* Parent: close write end, then wait for child using a poll loop.
+     *
+     * Rationale: when FAN_MARK_MOUNT is active kdialog opens config files
+     * on the same filesystem (e.g. ~/.config/kdeglobals) which generates
+     * FAN_OPEN_PERM events.  A blocking waitpid() would deadlock because
+     * the daemon can't respond to those events.  We pump the fanotify fd
+     * on every iteration to keep the kernel queue drained. */
     close(pipefd[1]);
+    log_msg(LOG_DEBUG, "[dialog] parent waiting for %s (pid=%d)", bin, (int)pid);
     char out[64] = "";
-    ssize_t nr = read(pipefd[0], out, sizeof(out) - 1);
-    if (nr > 0)
-        out[nr] = '\0';
-    close(pipefd[0]);
+    int got_output = 0;
+    int child_exited = 0;
+    int status = 0;
 
-    int status;
-    while (waitpid(pid, &status, 0) < 0)
+    /* Total timeout slightly longer than the inner "timeout 30" we exec. */
+#define DIALOG_OUTER_TIMEOUT_S 40
+    time_t deadline = time(NULL) + DIALOG_OUTER_TIMEOUT_S;
+
+    while (!child_exited && time(NULL) < deadline)
     {
-        if (errno == EINTR)
-            continue;
-        log_msg(LOG_ERR, "waitpid failed: %m");
-        return -1;
+        struct pollfd pfds[2];
+        int nfds = 0;
+
+        pfds[nfds].fd = pipefd[0];
+        pfds[nfds].events = POLLIN;
+        nfds++;
+
+        if (g_fan_fd >= 0)
+        {
+            pfds[nfds].fd = g_fan_fd;
+            pfds[nfds].events = POLLIN;
+            nfds++;
+        }
+
+        int ret = poll(pfds, (nfds_t)nfds, 200); /* 200 ms tick */
+        if (ret < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+
+        /* Pump fanotify first so the dialog child is never stalled. */
+        for (int i = 0; i < nfds; i++)
+        {
+            if (pfds[i].fd == g_fan_fd && (pfds[i].revents & POLLIN))
+                fanotify_pump(g_fan_fd, pid);
+        }
+
+        /* Collect dialog output if pipe is readable. */
+        for (int i = 0; i < nfds; i++)
+        {
+            if (pfds[i].fd == pipefd[0] &&
+                (pfds[i].revents & (POLLIN | POLLHUP)) &&
+                !got_output)
+            {
+                ssize_t nr = read(pipefd[0], out, sizeof(out) - 1);
+                if (nr > 0)
+                    out[nr] = '\0';
+                got_output = 1;
+            }
+        }
+
+        /* Non-blocking child-exit check. */
+        pid_t wr = waitpid(pid, &status, WNOHANG);
+        if (wr == pid)
+        {
+            child_exited = 1;
+        }
+        else if (wr < 0 && errno != EINTR)
+        {
+            log_msg(LOG_ERR, "waitpid failed: %m");
+            close(pipefd[0]);
+            return -1;
+        }
     }
+
+    if (!child_exited)
+    {
+        log_msg(LOG_WARNING, "[dialog] %s outer timeout, killing pid=%d", bin, (int)pid);
+        kill(pid, SIGKILL);
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+            ;
+    }
+
+    close(pipefd[0]);
+    log_msg(LOG_DEBUG, "[dialog] %s exited status=0x%x ec=%d",
+            bin, status, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
 
     if (!WIFEXITED(status))
         return -1;
@@ -342,6 +430,11 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
 
     /* Auto-detect the active graphical session if env vars are not set. */
     setup_display_env();
+    log_msg(LOG_DEBUG,
+            "[notify_ask] display env: WAYLAND=%s DISPLAY=%s uid=%d",
+            getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "(none)",
+            getenv("DISPLAY") ? getenv("DISPLAY") : "(none)",
+            (int)g_session_uid);
 
     /* Determine which dialog binary to use. */
     const char *bin = NULL;
@@ -377,10 +470,10 @@ int notify_ask(const char *comm, pid_t pid, pid_t ppid,
     /* User clicked Deny in the first dialog.  Show a follow-up to
      * distinguish between "Deny Once" and "Always Deny". */
     return run_dialog_confirm(bin,
-                "Block access this time only, or permanently?\n\n"
-                "\xe2\x80\xa2 Deny Once     \xe2\x80\x94 block this time only\n"
-                "\xe2\x80\xa2 Always Deny  \xe2\x80\x94 block this exact binary (SHA-512 verified)\n"
-                "                 in this call chain permanently",
-                "Deny Once", "Always Deny",
-                NOTIFY_DENY, NOTIFY_DENY_ALWAYS);
+                              "Block access this time only, or permanently?\n\n"
+                              "\xe2\x80\xa2 Deny Once     \xe2\x80\x94 block this time only\n"
+                              "\xe2\x80\xa2 Always Deny  \xe2\x80\x94 block this exact binary (SHA-512 verified)\n"
+                              "                 in this call chain permanently",
+                              "Deny Once", "Always Deny",
+                              NOTIFY_DENY, NOTIFY_DENY_ALWAYS);
 }

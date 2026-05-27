@@ -14,6 +14,7 @@ ETCDIR  := /etc
 SYSDDIR := /etc/systemd/system
 
 TARGET  := fileshield
+CLITGT  := fileshield-cli
 
 SRCS    := $(SRCDIR)/main.c $(SRCDIR)/utils.c $(SRCDIR)/config.c \
            $(SRCDIR)/cache.c $(SRCDIR)/notify.c $(SRCDIR)/fanotify.c \
@@ -21,14 +22,21 @@ SRCS    := $(SRCDIR)/main.c $(SRCDIR)/utils.c $(SRCDIR)/config.c \
 OBJS    := $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 DEPS    := $(OBJS:.o=.d)
 
+CLISRCS := $(SRCDIR)/cli.c
+CLIOBJS := $(CLISRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
+
 TESTS   := test_cache test_config test_utils test_persist
 TSTBINS := $(TESTS:%=$(OBJDIR)/%)
 
-all: $(OBJDIR)/$(TARGET)
+all: $(OBJDIR)/$(TARGET) $(OBJDIR)/$(CLITGT)
 
 $(OBJDIR)/$(TARGET): $(OBJS)
 	@mkdir -p $(OBJDIR)
 	$(CC) $(LDFLAGS) $(OBJS) -o $@
+
+$(OBJDIR)/$(CLITGT): $(CLIOBJS) $(OBJDIR)/persist.o $(OBJDIR)/utils.o
+	@mkdir -p $(OBJDIR)
+	$(CC) $(LDFLAGS) $(CLIOBJS) $(OBJDIR)/persist.o $(OBJDIR)/utils.o -o $@
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c
 	@mkdir -p $(OBJDIR)
@@ -67,6 +75,7 @@ test: all $(TSTBINS)
 
 install: all
 	install -m 0755 -D $(OBJDIR)/$(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
+	install -m 0755 -D $(OBJDIR)/$(CLITGT) $(DESTDIR)/usr/local/bin/$(CLITGT)
 	install -m 0640 -D fileshield.conf $(DESTDIR)$(ETCDIR)/fileshield.conf
 	install -m 0644 -D fileshield.service $(DESTDIR)$(SYSDDIR)/fileshield.service
 	systemctl daemon-reload
